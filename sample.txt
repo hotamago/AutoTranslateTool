@@ -1,0 +1,7 @@
+Hello world!
+
+This is a simple test file for translation.
+I hope you have a wonderful day.
+Programming is fun and exciting.
+
+Thank you for using this translation tool! 
