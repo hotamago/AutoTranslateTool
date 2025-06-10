@@ -1,0 +1,1 @@
+uv run main.py _temp/ManualTransFile.json _temp/vi.json --src-lang ja --dest-lang vi --format mapping --batch-size 8 --progress-file _temp/ManualTransFile.json.progress
