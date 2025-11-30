@@ -10,8 +10,6 @@ from tqdm import tqdm
 from translators import (
     GoogleTranslatorService,
     BingTranslatorService,
-    NLLBTranslatorService,
-    OpusMTTranslatorService,
     LMStudioTranslatorService,
 )
 from utils.cache import load_cache, append_to_cache, append_batch_to_cache, BatchCacheWriter
@@ -32,8 +30,7 @@ class TranslationManager:
         concurrency: int = 10,
         api_key: Optional[str] = None,
         batch_size: int = 10,
-        ignore_patterns: Optional[List[str]] = None,
-        model_url: Optional[str] = None
+        ignore_patterns: Optional[List[str]] = None
     ):
         self.service = service.lower()
         self.source_lang = source_lang
@@ -41,7 +38,6 @@ class TranslationManager:
         self.api_key = api_key
         self.concurrency = concurrency
         self.batch_size = batch_size
-        self.model_url = model_url
         
         # Compile ignore regex patterns
         self.ignore_patterns = compile_ignore_patterns(ignore_patterns or [])
@@ -62,14 +58,6 @@ class TranslationManager:
         elif self.service == 'bing':
             return BingTranslatorService(
                 self.source_lang, self.target_lang, self.concurrency, self.api_key
-            )
-        elif self.service == 'nllb':
-            return NLLBTranslatorService(
-                self.source_lang, self.target_lang, self.concurrency, self.api_key
-            )
-        elif self.service == 'opus-mt':
-            return OpusMTTranslatorService(
-                self.source_lang, self.target_lang, self.concurrency, self.api_key, self.model_url
             )
         elif self.service == 'lmstudio':
             return LMStudioTranslatorService(
@@ -138,8 +126,6 @@ class TranslationManager:
             # Process based on service type
             if self.service == 'lmstudio':
                 await self._process_lmstudio(pending_items, cache_file)
-            elif self.service in ['nllb', 'opus-mt']:
-                await self._process_model_batch(pending_items, cache_file)
             elif self.service == 'google':
                 await self._process_google_optimized(pending_items, cache_file)
             else:
@@ -187,59 +173,6 @@ class TranslationManager:
                         await append_to_cache(cache_file, k, v)
                     for k, v in ignored_items.items():
                         await append_to_cache(cache_file, k, v)
-                
-                pbar.update(len(batch_keys))
-    
-    async def _process_model_batch(self, pending_items: Dict, cache_file: str):
-        """Process items using model-based translators (NLLB, Opus-MT)."""
-        service_name = "NLLB" if self.service == 'nllb' else "opus-mt"
-        keys = list(pending_items.keys())
-        
-        with tqdm(total=len(keys), desc=f"Translating ({service_name} Batch)", unit="item") as pbar:
-            for i in range(0, len(keys), self.batch_size):
-                batch_keys = keys[i:i+self.batch_size]
-                batch_values = [pending_items[k] for k in batch_keys]
-                
-                to_translate_indices = []
-                to_translate_values = []
-                for idx, v in enumerate(batch_values):
-                    if isinstance(v, str) and not self._should_ignore(v):
-                        to_translate_indices.append(idx)
-                        to_translate_values.append(v)
-                
-                if to_translate_values:
-                    translated_values = await self.translator.translate_batch(to_translate_values)
-                else:
-                    translated_values = []
-                
-                trans_idx = 0
-                for idx, key in enumerate(batch_keys):
-                    val = batch_values[idx]
-                    if isinstance(val, str):
-                        if self._should_ignore(val):
-                            await append_to_cache(cache_file, key, val)
-                        elif trans_idx < len(translated_values):
-                            translated_val = translated_values[trans_idx]
-                            
-                            if has_duplicate_token_error(translated_val, val):
-                                logger.warning(
-                                    f"{service_name} duplicate token error detected "
-                                    f"for key '{key[:50]}...'. Falling back to Google Translate."
-                                )
-                                try:
-                                    google_fallback = await self._get_google_fallback()
-                                    translated_val = await google_fallback.translate_single(val)
-                                    logger.info(f"Google fallback successful for '{key[:50]}...'")
-                                except Exception as e:
-                                    logger.error(f"Google fallback failed: {e}")
-                                    translated_val = val
-                            
-                            await append_to_cache(cache_file, key, translated_val)
-                            trans_idx += 1
-                        else:
-                            logger.error(f"Mismatch in translation count for key {key}")
-                    else:
-                        await append_to_cache(cache_file, key, val)
                 
                 pbar.update(len(batch_keys))
     

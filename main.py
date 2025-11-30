@@ -37,7 +37,7 @@ async def main():
     )
     parser.add_argument(
         "-m", "--service", default="google",
-        help="Translation service (google, bing, nllb, opus-mt, lmstudio)"
+        help="Translation service (google, bing, lmstudio)"
     )
     parser.add_argument(
         "-c", "--concurrency", type=int, default=100,
@@ -50,10 +50,6 @@ async def main():
     parser.add_argument(
         "-k", "--api_key",
         help="API key for services that require it (e.g., bing)"
-    )
-    parser.add_argument(
-        "--model_url",
-        help="Model URL/identifier for opus-mt service (e.g., Helsinki-NLP/opus-mt-ja-vi)"
     )
     parser.add_argument(
         "--cache_file",
@@ -78,8 +74,7 @@ async def main():
         concurrency=args.concurrency,
         api_key=args.api_key,
         batch_size=args.batch_size,
-        ignore_patterns=args.ignore_regex,
-        model_url=args.model_url
+        ignore_patterns=args.ignore_regex
     )
     
     await manager.process_file(args.input_file, args.output_file, cache_file)
