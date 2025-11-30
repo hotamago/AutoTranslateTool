@@ -207,7 +207,7 @@ class GoogleTranslatorService(BaseTranslator):
         text: str,
         retry_count: int = 0
     ) -> Tuple[str, bool]:
-        """Translate with exponential backoff retry."""
+        """Translate with exponential backoff retry. Retries indefinitely until success."""
         if not text or not text.strip():
             return text, True
         
@@ -239,53 +239,56 @@ class GoogleTranslatorService(BaseTranslator):
                             item[0] if item and len(item) > 0 else ''
                             for item in data[0] if item
                         ])
-                        return translated_text if translated_text else text, True
-                    return text, True
+                        if translated_text:
+                            return translated_text, True
+                        # Empty translation, retry
+                        logger.warning(f"Empty translation received, retrying...")
+                        delay = min(self.base_delay * (2 ** retry_count), 60)
+                        await asyncio.sleep(delay)
+                        return await self._translate_with_retry(session, text, retry_count + 1)
+                    # No data, retry
+                    logger.warning(f"No translation data received, retrying...")
+                    delay = min(self.base_delay * (2 ** retry_count), 60)
+                    await asyncio.sleep(delay)
+                    return await self._translate_with_retry(session, text, retry_count + 1)
                 
                 elif response.status == 429:
                     self._stats.record_rate_limit()
                     self._adjust_throttle()
                     
-                    if retry_count < self.max_retries:
-                        delay = self.base_delay * (2 ** retry_count) + random.uniform(0.5, 1.5)
-                        logger.debug(f"Rate limited, waiting {delay:.2f}s (retry {retry_count + 1})")
-                        await asyncio.sleep(delay)
-                        # Try different endpoint on retry
-                        return await self._translate_with_retry(session, text, retry_count + 1)
-                    
-                    logger.warning(f"Rate limit exceeded after {self.max_retries} retries")
-                    return text, False
+                    delay = min(self.base_delay * (2 ** retry_count) + random.uniform(0.5, 1.5), 300)
+                    logger.debug(f"Rate limited (attempt {retry_count + 1}), waiting {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    # Try different endpoint on retry
+                    return await self._translate_with_retry(session, text, retry_count + 1)
                 
                 elif response.status >= 500:
                     self._stats.record_failure()
-                    if retry_count < self.max_retries:
-                        delay = self.base_delay * (2 ** retry_count)
-                        await asyncio.sleep(delay)
-                        return await self._translate_with_retry(session, text, retry_count + 1)
-                    return text, False
+                    delay = min(self.base_delay * (2 ** retry_count), 120)
+                    logger.warning(f"Server error {response.status} (attempt {retry_count + 1}), retrying in {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    return await self._translate_with_retry(session, text, retry_count + 1)
                 
                 else:
                     self._stats.record_failure()
-                    logger.warning(f"Google API returned status {response.status}")
-                    return text, False
+                    delay = min(self.base_delay * (2 ** retry_count), 120)
+                    logger.warning(f"Google API returned status {response.status} (attempt {retry_count + 1}), retrying in {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    return await self._translate_with_retry(session, text, retry_count + 1)
                     
         except asyncio.TimeoutError:
             self._stats.record_failure()
-            if retry_count < self.max_retries:
-                delay = self.base_delay * (2 ** retry_count)
-                await asyncio.sleep(delay)
-                return await self._translate_with_retry(session, text, retry_count + 1)
-            logger.warning(f"Timeout after {self.max_retries} retries for '{text[:30]}...'")
-            return text, False
+            delay = min(self.base_delay * (2 ** retry_count), 120)
+            logger.warning(f"Timeout (attempt {retry_count + 1}) for '{text[:30]}...', retrying in {delay:.2f}s")
+            await asyncio.sleep(delay)
+            return await self._translate_with_retry(session, text, retry_count + 1)
             
         except Exception as e:
             self._stats.record_failure()
-            if retry_count < self.max_retries:
-                delay = self.base_delay * (2 ** retry_count)
-                await asyncio.sleep(delay)
-                return await self._translate_with_retry(session, text, retry_count + 1)
-            logger.error(f"Translation error for '{text[:30]}...': {e}")
-            return text, False
+            delay = min(self.base_delay * (2 ** retry_count), 120)
+            logger.warning(f"Translation error (attempt {retry_count + 1}) for '{text[:30]}...': {e}, retrying in {delay:.2f}s")
+            await asyncio.sleep(delay)
+            return await self._translate_with_retry(session, text, retry_count + 1)
     
     async def translate_batch(self, texts: List[str]) -> List[str]:
         """
@@ -314,22 +317,38 @@ class GoogleTranslatorService(BaseTranslator):
         tasks = [translate_single(i, text) for i, text in enumerate(texts)]
         await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Handle failed translations with fallback (in batches)
-        if failed_indices:
-            logger.info(f"Using fallback for {len(failed_indices)} failed translations")
-            fallback_semaphore = asyncio.Semaphore(10)  # Limit fallback concurrency
+        # Retry failed translations until successful
+        while failed_indices:
+            logger.info(f"Retrying {len(failed_indices)} failed translations...")
+            retry_failed = []
             
-            async def fallback_translate(idx: int):
-                async with fallback_semaphore:
-                    results[idx] = await self._fallback_translate(texts[idx])
+            async def retry_translate(idx: int):
+                async with self.semaphore:
+                    session = self._get_session()
+                    translated, success = await self._translate_with_retry(session, texts[idx])
+                    if success:
+                        results[idx] = translated
+                    else:
+                        retry_failed.append(idx)
             
-            fallback_tasks = [fallback_translate(idx) for idx in failed_indices]
-            await asyncio.gather(*fallback_tasks, return_exceptions=True)
+            retry_tasks = [retry_translate(idx) for idx in failed_indices]
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+            failed_indices = retry_failed
         
-        return [r if r is not None else texts[i] for i, r in enumerate(results)]
+        # Verify all results are present (retry any missing ones)
+        missing_indices = [i for i, r in enumerate(results) if r is None]
+        if missing_indices:
+            logger.warning(f"Retrying {len(missing_indices)} missing translations...")
+            for idx in missing_indices:
+                async with self.semaphore:
+                    session = self._get_session()
+                    translated, success = await self._translate_with_retry(session, texts[idx])
+                    results[idx] = translated
+        
+        return results
     
-    async def _fallback_translate(self, text: str) -> str:
-        """Fallback translation using deep_translator."""
+    async def _fallback_translate(self, text: str, retry_count: int = 0) -> str:
+        """Fallback translation using deep_translator. Retries indefinitely until success."""
         try:
             if self.google_translator is None:
                 self.google_translator = GoogleTranslator(
@@ -342,10 +361,18 @@ class GoogleTranslatorService(BaseTranslator):
                 self.google_translator.translate,
                 text
             )
-            return translated if translated else text
+            if translated:
+                return translated
+            # Empty translation, retry
+            delay = min(self.base_delay * (2 ** retry_count), 60)
+            logger.warning(f"Fallback translation empty (attempt {retry_count + 1}), retrying in {delay:.2f}s")
+            await asyncio.sleep(delay)
+            return await self._fallback_translate(text, retry_count + 1)
         except Exception as e:
-            logger.error(f"Fallback translation failed for '{text[:30]}...': {e}")
-            return text
+            delay = min(self.base_delay * (2 ** retry_count), 120)
+            logger.warning(f"Fallback translation failed (attempt {retry_count + 1}) for '{text[:30]}...': {e}, retrying in {delay:.2f}s")
+            await asyncio.sleep(delay)
+            return await self._fallback_translate(text, retry_count + 1)
     
     async def translate_single(self, text: str) -> str:
         """Translate a single text."""
@@ -357,10 +384,14 @@ class GoogleTranslatorService(BaseTranslator):
         
         async with self.semaphore:
             session = self._get_session()
-            translated, success = await self._translate_with_retry(session, text)
-            if not success:
-                return await self._fallback_translate(text)
-            return translated
+            # Retry until successful
+            while True:
+                translated, success = await self._translate_with_retry(session, text)
+                if success:
+                    return translated
+                # If not successful, retry (shouldn't happen with new retry logic, but keep as safety)
+                logger.warning(f"Translation failed for single text, retrying...")
+                await asyncio.sleep(1)
     
     async def translate_batch_parallel(
         self, 
@@ -390,14 +421,31 @@ class GoogleTranslatorService(BaseTranslator):
             return_exceptions=True
         )
         
-        # Flatten and handle errors
+        # Flatten and handle errors - retry failed chunks
         results = []
+        failed_chunks = []
         for i, chunk_result in enumerate(chunk_results):
             if isinstance(chunk_result, Exception):
-                logger.error(f"Chunk {i} failed: {chunk_result}")
-                results.extend(chunks[i])  # Return original texts on failure
+                logger.error(f"Chunk {i} failed: {chunk_result}, will retry")
+                failed_chunks.append(i)
             else:
                 results.extend(chunk_result)
+        
+        # Retry failed chunks
+        while failed_chunks:
+            logger.info(f"Retrying {len(failed_chunks)} failed chunks...")
+            retry_chunks = []
+            retry_results = await asyncio.gather(
+                *[self.translate_batch(chunks[i]) for i in failed_chunks],
+                return_exceptions=True
+            )
+            for i, chunk_idx in enumerate(failed_chunks):
+                if isinstance(retry_results[i], Exception):
+                    logger.error(f"Chunk {chunk_idx} failed again: {retry_results[i]}")
+                    retry_chunks.append(chunk_idx)
+                else:
+                    results.extend(retry_results[i])
+            failed_chunks = retry_chunks
         
         return results
     

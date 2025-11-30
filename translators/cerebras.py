@@ -200,46 +200,41 @@ Output the translated JSON:"""
     
     def _parse_batch_response(self, content: str, original_texts: List[str]) -> List[str]:
         """Parse the batch translation response."""
-        try:
-            # Try to extract JSON from the response
-            content = content.strip()
-            
-            # Handle markdown code blocks
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                parts = content.split("```")
-                if len(parts) >= 2:
-                    content = parts[1].strip()
-            
-            # Find JSON object boundaries
-            start = content.find('{')
-            end = content.rfind('}')
-            
-            if start != -1 and end != -1 and end > start:
-                json_str = content[start:end + 1]
-                result = json.loads(json_str)
-                
-                # Extract translations in order
-                translations = []
-                for i in range(len(original_texts)):
-                    key = str(i)
-                    if key in result:
-                        translations.append(result[key])
-                    else:
-                        # Fallback to original if key missing
-                        logger.warning(f"Missing translation for index {i}")
-                        translations.append(original_texts[i])
-                
-                return translations
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response: {e}")
-        except Exception as e:
-            logger.error(f"Error parsing response: {e}")
+        # Try to extract JSON from the response
+        content = content.strip()
         
-        # Return originals on parse failure
-        return original_texts
+        # Handle markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            parts = content.split("```")
+            if len(parts) >= 2:
+                content = parts[1].strip()
+        
+        # Find JSON object boundaries
+        start = content.find('{')
+        end = content.rfind('}')
+        
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No valid JSON object found in response")
+        
+        json_str = content[start:end + 1]
+        result = json.loads(json_str)
+        
+        # Extract translations in order
+        translations = []
+        missing_indices = []
+        for i in range(len(original_texts)):
+            key = str(i)
+            if key in result:
+                translations.append(result[key])
+            else:
+                missing_indices.append(i)
+        
+        if missing_indices:
+            raise ValueError(f"Missing translations for indices: {missing_indices}")
+        
+        return translations
     
     async def _wait_for_rate_limit(self, estimated_tokens: int):
         """Wait if necessary to respect rate limits."""
@@ -258,7 +253,7 @@ Output the translated JSON:"""
         texts: List[str], 
         retry_count: int = 0
     ) -> Tuple[List[str], bool]:
-        """Make a single batch translation request."""
+        """Make a single batch translation request. Retries indefinitely until success."""
         if not texts:
             return [], True
         
@@ -309,22 +304,16 @@ Output the translated JSON:"""
             
             # Check for rate limit errors
             if "rate" in error_msg or "429" in error_msg or "limit" in error_msg:
-                if retry_count < self.max_retries:
-                    wait_time = (2 ** retry_count) * 5  # Longer backoff for rate limits
-                    logger.warning(f"Rate limited, waiting {wait_time}s before retry")
-                    await asyncio.sleep(wait_time)
-                    return await self._translate_batch_request(texts, retry_count + 1)
-            
-            # Retry on other errors
-            if retry_count < self.max_retries:
-                wait_time = (2 ** retry_count) * 2
-                logger.warning(f"Request failed: {e}, retrying in {wait_time}s")
+                wait_time = min((2 ** retry_count) * 5, 300)  # Cap at 5 minutes, longer backoff for rate limits
+                logger.warning(f"Rate limited (attempt {retry_count + 1}), waiting {wait_time}s before retry")
                 await asyncio.sleep(wait_time)
                 return await self._translate_batch_request(texts, retry_count + 1)
             
-            logger.error(f"Batch translation failed after {self.max_retries} retries: {e}")
-            self._stats.record_failure(len(texts))
-            return texts, False
+            # Retry on other errors indefinitely
+            wait_time = min((2 ** retry_count) * 2, 120)  # Cap at 2 minutes
+            logger.warning(f"Request failed (attempt {retry_count + 1}): {e}, retrying in {wait_time}s")
+            await asyncio.sleep(wait_time)
+            return await self._translate_batch_request(texts, retry_count + 1)
     
     def _make_completion_request(self, prompt: str):
         """Make a synchronous completion request (called from executor)."""
@@ -405,17 +394,31 @@ Output the translated JSON:"""
                 batch = batches[batch_idx]
                 start, end = batch_ranges[batch_idx]
                 
-                translations, success = await self._translate_batch_request(batch)
-                
-                for i, translation in enumerate(translations):
-                    results[start + i] = translation
+                # Retry until successful
+                while True:
+                    translations, success = await self._translate_batch_request(batch)
+                    if success:
+                        for i, translation in enumerate(translations):
+                            results[start + i] = translation
+                        break
+                    # If not successful, retry (shouldn't happen with new retry logic, but keep as safety)
+                    logger.warning(f"Batch {batch_idx} failed, retrying...")
+                    await asyncio.sleep(1)
         
         # Run all batches concurrently (semaphore limits actual concurrency)
         tasks = [process_batch(i) for i in range(len(batches))]
         await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Fill any None values with originals
-        return [r if r is not None else texts[i] for i, r in enumerate(results)]
+        # Verify all results are present (retry any missing ones)
+        missing_indices = [i for i, r in enumerate(results) if r is None]
+        if missing_indices:
+            logger.warning(f"Retrying {len(missing_indices)} missing translations...")
+            missing_texts = [texts[i] for i in missing_indices]
+            missing_translations = await self.translate_batch(missing_texts)
+            for idx, trans in zip(missing_indices, missing_translations):
+                results[idx] = trans
+        
+        return results
     
     async def translate_batch_dict(self, items: Dict) -> Dict:
         """Translate a dictionary of items."""

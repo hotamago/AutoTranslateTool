@@ -39,12 +39,15 @@ class BingTranslatorService(BaseTranslator):
             )
     
     async def translate_batch(self, texts: List[str]) -> List[str]:
-        """Translate multiple texts using Bing Translate."""
+        """Translate multiple texts using Bing Translate. Retries indefinitely until success."""
         if not texts:
             return []
         
-        async def translate_single(text: str) -> str:
-            """Translate a single text."""
+        async def translate_single(text: str, retry_count: int = 0) -> str:
+            """Translate a single text. Retries indefinitely until success."""
+            if not text or not text.strip():
+                return text
+            
             async with self.semaphore:
                 try:
                     if self.bing_translator is None:
@@ -55,10 +58,18 @@ class BingTranslatorService(BaseTranslator):
                         self.bing_translator.translate,
                         text
                     )
-                    return translated
+                    if translated and translated.strip():
+                        return translated
+                    # Empty translation, retry
+                    delay = min(0.5 * (2 ** retry_count), 60)
+                    logger.warning(f"Empty translation received (attempt {retry_count + 1}), retrying in {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    return await translate_single(text, retry_count + 1)
                 except Exception as e:
-                    logger.error(f"Failed to translate '{text[:20]}...': {e}")
-                    return text
+                    delay = min(0.5 * (2 ** retry_count), 120)
+                    logger.warning(f"Failed to translate '{text[:30]}...' (attempt {retry_count + 1}): {e}, retrying in {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    return await translate_single(text, retry_count + 1)
         
         tasks = [translate_single(text) for text in texts]
         results = await asyncio.gather(*tasks)

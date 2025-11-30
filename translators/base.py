@@ -57,11 +57,16 @@ class BaseTranslator(ABC):
         pass
     
     async def translate_single(self, text: str) -> str:
-        """Translate a single text (default implementation uses batch)."""
+        """Translate a single text (default implementation uses batch). Retries indefinitely until success."""
         if not text:
             return ""
-        results = await self.translate_batch([text])
-        return results[0] if results else text
+        # Retry until we get a result (translate_batch already retries internally, but this is a safety check)
+        while True:
+            results = await self.translate_batch([text])
+            if results and len(results) > 0 and results[0]:
+                return results[0]
+            # If no result, retry (shouldn't happen since translate_batch retries, but keep as safety)
+            await asyncio.sleep(1)
     
     async def cleanup(self):
         """Cleanup resources."""

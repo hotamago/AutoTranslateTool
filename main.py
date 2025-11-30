@@ -37,15 +37,15 @@ async def main():
     )
     parser.add_argument(
         "-m", "--service", default="google",
-        help="Translation service (google, bing, lmstudio, cerebras)"
+        help="Translation service(s) - single service or comma-separated mix (e.g., 'google,cerebras,lmstudio')"
     )
     parser.add_argument(
-        "-c", "--concurrency", type=int, default=100,
-        help="Concurrency level (default: 100, optimized for Google)"
+        "-c", "--concurrency", type=str, default="100",
+        help="Concurrency level(s) - single value or comma-separated per service (e.g., '100,4' for google,cerebras). Default: 100"
     )
     parser.add_argument(
-        "-b", "--batch_size", type=int, default=200,
-        help="Batch size for processing (default: 200)"
+        "-b", "--batch_size", type=str, default="200",
+        help="Batch size(s) - single value or comma-separated per service (e.g., '1,200' for google,cerebras). Default: 200"
     )
     parser.add_argument(
         "-k", "--api_key",
@@ -67,13 +67,66 @@ async def main():
     if not cache_file:
         cache_file = args.output_file + ".cache"
     
+    # Parse comma-separated services
+    services = [s.strip().lower() for s in args.service.split(',') if s.strip()]
+    if not services:
+        logger.error("No valid services specified")
+        return
+    
+    # Parse comma-separated concurrency values
+    concurrency_values = [c.strip() for c in args.concurrency.split(',') if c.strip()]
+    concurrency_ints = []
+    for c in concurrency_values:
+        try:
+            concurrency_ints.append(int(c))
+        except ValueError:
+            logger.warning(f"Invalid concurrency value '{c}', using default 100")
+            concurrency_ints.append(100)
+    
+    # Parse comma-separated batch_size values
+    batch_size_values = [b.strip() for b in args.batch_size.split(',') if b.strip()]
+    batch_size_ints = []
+    for b in batch_size_values:
+        try:
+            batch_size_ints.append(int(b))
+        except ValueError:
+            logger.warning(f"Invalid batch_size value '{b}', using default 200")
+            batch_size_ints.append(200)
+    
+    # Match concurrency and batch_size to services
+    # If fewer values than services, use last value for remaining services
+    # If more values than services, ignore extra values
+    service_concurrency = {}
+    service_batch_size = {}
+    
+    for i, service in enumerate(services):
+        if i < len(concurrency_ints):
+            service_concurrency[service] = concurrency_ints[i]
+        elif concurrency_ints:
+            service_concurrency[service] = concurrency_ints[-1]  # Use last value
+        else:
+            service_concurrency[service] = 100  # Default
+        
+        if i < len(batch_size_ints):
+            service_batch_size[service] = batch_size_ints[i]
+        elif batch_size_ints:
+            service_batch_size[service] = batch_size_ints[-1]  # Use last value
+        else:
+            service_batch_size[service] = 200  # Default
+    
+    config_str = ", ".join([
+        f"{s}: concurrency={service_concurrency[s]}, batch_size={service_batch_size[s]}" 
+        for s in services
+    ])
+    logger.info(f"Service configurations: {config_str}")
+    
     manager = TranslationManager(
-        service=args.service,
+        services=services,
         source_lang=args.source_lang,
         target_lang=args.target_lang,
-        concurrency=args.concurrency,
+        service_concurrency=service_concurrency,
         api_key=args.api_key,
-        batch_size=args.batch_size,
+        service_batch_size=service_batch_size,
         ignore_patterns=args.ignore_regex
     )
     
