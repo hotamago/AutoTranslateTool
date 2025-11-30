@@ -1,1 +1,1 @@
-uv run main.py _temp/ManualTransFile.json _temp/vi.json --src-lang ja --dest-lang vi --format mapping --batch-size 8 --progress-file _temp/ManualTransFile.json.progress
+uv run main.py -s ja -t vi -i "_temp/ManualTransFile.json" -o "_temp/ManualTransFile_out.json" -m nllb -b 32 --cache_file "_temp\ManualTransFile_out.json.cache" --ignore_regex "^[0-9]+$"

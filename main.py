@@ -4,12 +4,26 @@ import json
 import logging
 import sys
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Set, Dict
+from typing import Set, Dict, List, Optional
 
 import aiofiles
+import aiohttp
 from deep_translator import GoogleTranslator, MicrosoftTranslator
 from tqdm import tqdm
+
+NLLB_LANG_MAP = {
+    'en': 'eng_Latn',
+    'vi': 'vie_Latn',
+    'ja': 'jpn_Jpan',
+    'ko': 'kor_Hang',
+    'zh': 'zho_Hans',
+    'fr': 'fra_Latn',
+    'es': 'spa_Latn',
+    'de': 'deu_Latn',
+    'ru': 'rus_Cyrl',
+}
 
 # Configure logging
 logging.basicConfig(
@@ -20,13 +34,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TranslationManager:
-    def __init__(self, service: str, source_lang: str, target_lang: str, concurrency: int = 10, api_key: str = None):
+    def __init__(self, service: str, source_lang: str, target_lang: str, concurrency: int = 10, api_key: str = None, batch_size: int = 10, ignore_patterns: Optional[List[str]] = None):
         self.service = service.lower()
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.api_key = api_key
+        self.concurrency = concurrency
+        self.batch_size = batch_size
         self.semaphore = asyncio.Semaphore(concurrency)
         self.executor = ThreadPoolExecutor(max_workers=concurrency)
+        
+        # Compile ignore regex patterns
+        self.ignore_patterns = []
+        if ignore_patterns:
+            for pattern in ignore_patterns:
+                try:
+                    compiled = re.compile(pattern)
+                    self.ignore_patterns.append(compiled)
+                    logger.info(f"Added ignore pattern: {pattern}")
+                except re.error as e:
+                    logger.warning(f"Invalid regex pattern '{pattern}': {e}. Ignoring.")
+        
+        self.nllb_model = None
+        self.nllb_tokenizer = None
+        self.device = None
+
+    def should_ignore(self, text: str) -> bool:
+        """Check if text matches any ignore pattern."""
+        if not isinstance(text, str) or not text:
+            return False
+        for pattern in self.ignore_patterns:
+            if pattern.search(text):
+                return True
+        return False
 
     def get_translator(self):
         if self.service == 'google':
@@ -36,7 +76,7 @@ class TranslationManager:
                 logger.warning("Bing (Microsoft) translator requires an API key. Please provide one with --api_key.")
             return MicrosoftTranslator(source=self.source_lang, target=self.target_lang, api_key=self.api_key)
         else:
-            if self.service not in ['google', 'bing']:
+            if self.service not in ['google', 'bing', 'nllb', 'lmstudio']:
                 logger.warning(f"Service '{self.service}' not explicitly supported. Defaulting to Google.")
                 return GoogleTranslator(source=self.source_lang, target=self.target_lang)
             return GoogleTranslator(source=self.source_lang, target=self.target_lang)
@@ -59,6 +99,185 @@ class TranslationManager:
                 logger.error(f"Failed to translate '{text[:20]}...': {e}")
                 return text
 
+    async def init_nllb(self):
+        if self.service == 'nllb' and not self.nllb_model:
+            logger.info("Loading NLLB model...")
+            try:
+                from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+                import torch
+                
+                # Enhanced GPU detection and diagnostics
+                logger.info("Checking GPU availability...")
+                logger.info(f"PyTorch version: {torch.__version__}")
+                logger.info(f"CUDA available: {torch.cuda.is_available()}")
+                if torch.cuda.is_available():
+                    logger.info(f"CUDA version: {torch.version.cuda}")
+                    logger.info(f"Number of GPUs: {torch.cuda.device_count()}")
+                    for i in range(torch.cuda.device_count()):
+                        logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+                        logger.info(f"  Memory: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
+                else:
+                    logger.warning("CUDA is not available. PyTorch may have been installed without CUDA support.")
+                    logger.warning("To use GPU, install PyTorch with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu121")
+                
+                if torch.cuda.is_available():
+                    self.device = torch.device("cuda")
+                    logger.info(f"Using device: {self.device} (GPU)")
+                else:
+                    self.device = torch.device("cpu")
+                    logger.warning(f"Using device: {self.device} (CPU)")
+                
+                # Create models directory if it doesn't exist
+                models_dir = "./_models"
+                os.makedirs(models_dir, exist_ok=True)
+                
+                model_name = "facebook/nllb-200-distilled-1.3B"
+                
+                # Check if model is already cached by looking for the model file
+                # The model should be in: _models/models--facebook--nllb-200-distilled-1.3B/snapshots/*/pytorch_model.bin
+                model_cached = False
+                model_cache_path = os.path.join(models_dir, "models--facebook--nllb-200-distilled-1.3B")
+                if os.path.exists(model_cache_path):
+                    # Look for pytorch_model.bin in any snapshot directory
+                    snapshots_dir = os.path.join(model_cache_path, "snapshots")
+                    if os.path.exists(snapshots_dir):
+                        for snapshot in os.listdir(snapshots_dir):
+                            snapshot_path = os.path.join(snapshots_dir, snapshot)
+                            model_file = os.path.join(snapshot_path, "pytorch_model.bin")
+                            if os.path.exists(model_file):
+                                model_cached = True
+                                logger.info(f"Found cached model in {models_dir}")
+                                break
+                
+                # Clean up any incomplete download files
+                if os.path.exists(model_cache_path):
+                    blobs_dir = os.path.join(model_cache_path, "blobs")
+                    if os.path.exists(blobs_dir):
+                        for blob_file in os.listdir(blobs_dir):
+                            if blob_file.endswith(".incomplete"):
+                                incomplete_path = os.path.join(blobs_dir, blob_file)
+                                try:
+                                    os.remove(incomplete_path)
+                                    logger.info(f"Removed incomplete download: {blob_file}")
+                                except Exception as e:
+                                    logger.warning(f"Could not remove incomplete file {blob_file}: {e}")
+                
+                # Use local_files_only if model is cached to prevent re-downloading
+                if model_cached:
+                    logger.info(f"Loading from cache: {models_dir}")
+                    self.nllb_tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=models_dir, local_files_only=True)
+                    self.nllb_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=models_dir, local_files_only=True)
+                else:
+                    logger.info(f"Downloading and caching model to: {models_dir}")
+                    self.nllb_tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=models_dir)
+                    self.nllb_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=models_dir)
+                
+                # Move model to device after loading
+                self.nllb_model = self.nllb_model.to(self.device)
+                self.nllb_model.eval()  # Set to evaluation mode
+                
+                # Verify model is on the correct device
+                if isinstance(self.device, torch.device) and self.device.type == "cuda":
+                    model_device = next(self.nllb_model.parameters()).device
+                    logger.info(f"Model loaded on device: {model_device}")
+                    if model_device.type != "cuda":
+                        logger.error(f"WARNING: Model is on {model_device} but expected CUDA!")
+                    else:
+                        logger.info("✓ Model successfully loaded on GPU")
+                
+                logger.info("NLLB model loaded.")
+            except ImportError:
+                logger.error("Transformers or Torch not installed. Please install them to use NLLB.")
+                sys.exit(1)
+            except Exception as e:
+                logger.error(f"Failed to load NLLB model: {e}")
+                sys.exit(1)
+
+    async def translate_batch_nllb(self, texts: list[str]) -> list[str]:
+        if not texts:
+            return []
+        
+        src = NLLB_LANG_MAP.get(self.source_lang, self.source_lang)
+        tgt = NLLB_LANG_MAP.get(self.target_lang, self.target_lang)
+        
+        try:
+            import torch
+            self.nllb_tokenizer.src_lang = src
+            inputs = self.nllb_tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
+            
+            # Move all input tensors to the correct device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Get the target language token ID using convert_tokens_to_ids
+            # (lang_code_to_id was removed in recent transformers versions)
+            forced_bos_token_id = self.nllb_tokenizer.convert_tokens_to_ids(tgt)
+            
+            # Use torch.no_grad() for inference to save memory
+            with torch.no_grad():
+                translated_tokens = self.nllb_model.generate(
+                    **inputs, forced_bos_token_id=forced_bos_token_id, max_length=512
+                )
+            
+            # Move tokens back to CPU for decoding
+            translated_tokens = translated_tokens.cpu()
+            return self.nllb_tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+        except Exception as e:
+            logger.error(f"NLLB batch translation failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return texts # Return original on failure
+
+    async def translate_batch_lmstudio(self, items: dict) -> dict:
+        if not items:
+            return {}
+            
+        prompt = f"""
+You are a professional translator. Translate the following JSON content from {self.source_lang} to {self.target_lang}.
+Maintain the keys and structure exactly. Output ONLY the translated JSON.
+JSON to translate:
+{json.dumps(items, ensure_ascii=False)}
+"""
+        payload = {
+            "messages": [
+                { "role": "system", "content": "You are a helpful assistant that translates JSON files." },
+                { "role": "user", "content": prompt }
+            ],
+            "temperature": 0.3,
+            "max_tokens": -1,
+            "stream": False
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://127.0.0.1:1234/v1/chat/completions", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        content = result['choices'][0]['message']['content']
+                        # Parse JSON from content
+                        try:
+                            if "```json" in content:
+                                content = content.split("```json")[1].split("```")[0].strip()
+                            elif "```" in content:
+                                content = content.split("```")[1].split("```")[0].strip()
+                            return json.loads(content)
+                        except json.JSONDecodeError:
+                            # Try to find JSON object in text
+                            start = content.find('{')
+                            end = content.rfind('}')
+                            if start != -1 and end != -1:
+                                try:
+                                    return json.loads(content[start:end+1])
+                                except Exception:
+                                    pass
+                            logger.error("Failed to parse JSON from LM Studio response")
+                            return {}
+                    else:
+                        logger.error(f"LM Studio error: {response.status}")
+                        return {}
+        except Exception as e:
+            logger.error(f"LM Studio request failed: {e}")
+            return {}
+
     async def load_cache(self, cache_file: str) -> Set[str]:
         completed_keys = set()
         if not os.path.exists(cache_file):
@@ -66,7 +285,9 @@ class TranslationManager:
         
         logger.info(f"Loading cache from {cache_file}...")
         try:
-            async with aiofiles.open(cache_file, 'r', encoding='utf-8') as f:
+            # Use errors='replace' to handle invalid UTF-8 bytes gracefully
+            # Invalid bytes will be replaced with the Unicode replacement character ()
+            async with aiofiles.open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
                 async for line in f:
                     try:
                         entry = json.loads(line)
@@ -124,21 +345,103 @@ class TranslationManager:
 
         logger.info(f"Starting translation from {self.source_lang} to {self.target_lang} using {self.service}...")
         
-        with tqdm(total=len(pending_items), desc="Translating", unit="key") as pbar:
-            async def process_item(k, v):
-                if isinstance(v, str):
-                    translated_val = await self.translate_text(v)
-                    await self.append_to_cache(cache_file, k, translated_val)
-                    pbar.update(1)
-                else:
-                    # Non-string value, just write as is or skip?
-                    # Let's write as is to cache so it's marked done.
-                    await self.append_to_cache(cache_file, k, v)
-                    pbar.update(1)
+        if self.service == 'nllb':
+            await self.init_nllb()
+            
+            keys = list(pending_items.keys())
+            with tqdm(total=len(keys), desc="Translating (NLLB Batch)", unit="item") as pbar:
+                for i in range(0, len(keys), self.batch_size):
+                    batch_keys = keys[i:i+self.batch_size]
+                    batch_values = [pending_items[k] for k in batch_keys]
+                    
+                    # Filter out non-string values and ignored patterns for translation
+                    to_translate_indices = []
+                    to_translate_values = []
+                    for idx, v in enumerate(batch_values):
+                        if isinstance(v, str) and not self.should_ignore(v):
+                            to_translate_indices.append(idx)
+                            to_translate_values.append(v)
+                    
+                    if to_translate_values:
+                        translated_values = await self.translate_batch_nllb(to_translate_values)
+                    else:
+                        translated_values = []
+                        
+                    # Reconstruct batch result
+                    trans_idx = 0
+                    for idx, key in enumerate(batch_keys):
+                        val = batch_values[idx]
+                        if isinstance(val, str):
+                            if self.should_ignore(val):
+                                # Skip translation, use original value
+                                await self.append_to_cache(cache_file, key, val)
+                            elif trans_idx < len(translated_values):
+                                await self.append_to_cache(cache_file, key, translated_values[trans_idx])
+                                trans_idx += 1
+                            else:
+                                # Should not happen unless translation returned fewer items
+                                logger.error(f"Mismatch in translation count for key {key}")
+                        else:
+                            await self.append_to_cache(cache_file, key, val)
+                    
+                    pbar.update(len(batch_keys))
+                    
+        elif self.service == 'lmstudio':
+            keys = list(pending_items.keys())
+            with tqdm(total=len(keys), desc="Translating (LM Studio Batch)", unit="item") as pbar:
+                for i in range(0, len(keys), self.batch_size):
+                    batch_keys = keys[i:i+self.batch_size]
+                    batch_items = {k: pending_items[k] for k in batch_keys}
+                    
+                    # Separate ignored items from items to translate
+                    items_to_translate = {}
+                    ignored_items = {}
+                    for k, v in batch_items.items():
+                        if isinstance(v, str) and self.should_ignore(v):
+                            ignored_items[k] = v
+                        else:
+                            items_to_translate[k] = v
+                    
+                    # Translate only non-ignored items
+                    translated_batch = {}
+                    if items_to_translate:
+                        translated_batch = await self.translate_batch_lmstudio(items_to_translate)
+                    
+                    # If translation failed entirely, translated_batch might be empty
+                    # We should probably retry or skip. For now, we skip updating cache so it can be retried later.
+                    if not translated_batch and items_to_translate:
+                        logger.warning(f"Batch {i//self.batch_size} failed or returned empty.")
+                        # Optionally write failures? No, keep them pending.
+                    else:
+                        # Write translated items
+                        for k, v in translated_batch.items():
+                            await self.append_to_cache(cache_file, k, v)
+                        # Write ignored items (original values)
+                        for k, v in ignored_items.items():
+                            await self.append_to_cache(cache_file, k, v)
+                            
+                    pbar.update(len(batch_keys))
 
-            tasks = [process_item(k, v) for k, v in pending_items.items()]
-            # Use gather to run concurrently
-            await asyncio.gather(*tasks)
+        else:
+            with tqdm(total=len(pending_items), desc="Translating", unit="key") as pbar:
+                async def process_item(k, v):
+                    if isinstance(v, str):
+                        if self.should_ignore(v):
+                            # Skip translation, use original value
+                            await self.append_to_cache(cache_file, k, v)
+                        else:
+                            translated_val = await self.translate_text(v)
+                            await self.append_to_cache(cache_file, k, translated_val)
+                        pbar.update(1)
+                    else:
+                        # Non-string value, just write as is or skip?
+                        # Let's write as is to cache so it's marked done.
+                        await self.append_to_cache(cache_file, k, v)
+                        pbar.update(1)
+    
+                tasks = [process_item(k, v) for k, v in pending_items.items()]
+                # Use gather to run concurrently
+                await asyncio.gather(*tasks)
 
         await self.finalize_output(data, cache_file, output_file)
 
@@ -152,7 +455,9 @@ class TranslationManager:
         translated_map = {}
         if os.path.exists(cache_file):
             try:
-                async with aiofiles.open(cache_file, 'r', encoding='utf-8') as f:
+                # Use errors='replace' to handle invalid UTF-8 bytes gracefully
+                # Invalid bytes will be replaced with the Unicode replacement character ()
+                async with aiofiles.open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
                     async for line in f:
                         try:
                             entry = json.loads(line)
@@ -190,8 +495,10 @@ async def main():
     parser.add_argument("-o", "--output_file", required=True, help="Path to output JSON file")
     parser.add_argument("-m", "--service", default="google", help="Translation service (google, bing, ...)")
     parser.add_argument("-c", "--concurrency", type=int, default=10, help="Concurrency level (default: 10)")
+    parser.add_argument("-b", "--batch_size", type=int, default=10, help="Batch size for NLLB/LM Studio (default: 10)")
     parser.add_argument("-k", "--api_key", help="API key for services that require it (e.g., bing)")
     parser.add_argument("--cache_file", help="Path to cache file (JSONL). Defaults to <output_file>.cache")
+    parser.add_argument("--ignore_regex", action="append", help="Regex pattern to ignore during translation (can be specified multiple times). Example: '^[0-9]+$' to ignore pure numbers")
 
     args = parser.parse_args()
 
@@ -204,7 +511,9 @@ async def main():
         source_lang=args.source_lang,
         target_lang=args.target_lang,
         concurrency=args.concurrency,
-        api_key=args.api_key
+        api_key=args.api_key,
+        batch_size=args.batch_size,
+        ignore_patterns=args.ignore_regex
     )
 
     await manager.process_file(args.input_file, args.output_file, cache_file)
