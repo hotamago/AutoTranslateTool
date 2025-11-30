@@ -1,6 +1,5 @@
 """LM Studio translation service implementation with batch and concurrent optimization."""
 
-import asyncio
 import json
 import logging
 import time
@@ -8,6 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .base import BaseTranslator
+from utils.batch_manager import BatchManager, BatchItem, TokenAwareBatchBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +177,13 @@ Output the translated JSON:"""
         
         return translations
     
-    def _parse_dict_response(self, content: str, original_items: Dict) -> Dict:
-        """Parse the dictionary translation response."""
+    def _parse_dict_response(self, content: str, original_items: Dict) -> Tuple[Dict, List[str]]:
+        """Parse the dictionary translation response.
+        
+        Returns:
+            Tuple of (translated_dict, missing_keys) where missing_keys is a list of keys
+            that were not found in the response.
+        """
         # Try to extract JSON from the response
         content = content.strip()
         
@@ -202,157 +207,139 @@ Output the translated JSON:"""
         
         # Check for missing keys
         missing_keys = [key for key in original_items.keys() if key not in result]
-        if missing_keys:
-            raise ValueError(f"Missing translations for keys: {missing_keys}")
         
-        return result
+        return result, missing_keys
     
     async def _translate_batch_request(
         self, 
-        texts: List[str], 
-        retry_count: int = 0
-    ) -> Tuple[List[str], bool]:
-        """Make a single batch translation request."""
+        texts: List[str]
+    ) -> List[str]:
+        """Make a single batch translation request (no retries - handled by batch manager)."""
         if not texts:
-            return [], True
+            return []
         
         start_time = time.time()
         
-        try:
-            prompt = self._create_batch_prompt(texts)
-            estimated_tokens = self._estimate_batch_tokens(texts)
-            
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a professional translator. You translate text accurately "
-                            "while preserving meaning, tone, and formatting. You always respond "
-                            "with valid JSON containing the translations."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": -1,
-                "stream": False
-            }
-            
-            session = await self._init_http_session()
-            async with session.post(self.api_url, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    
-                    if not content:
-                        raise RuntimeError("Empty response from LM Studio API")
-                    
-                    # Estimate tokens from usage if available
-                    usage = result.get('usage', {})
-                    input_tokens = usage.get('prompt_tokens', estimated_tokens)
-                    output_tokens = usage.get('completion_tokens', 0)
-                    
-                    # Parse response
-                    translations = self._parse_batch_response(content, texts)
-                    
-                    elapsed = time.time() - start_time
-                    self._stats.record_success(len(texts), input_tokens, output_tokens, elapsed)
-                    
-                    logger.debug(
-                        f"Batch of {len(texts)} translated in {elapsed:.2f}s "
-                        f"(tokens: {input_tokens}+{output_tokens})"
+        prompt = self._create_batch_prompt(texts)
+        estimated_tokens = self._estimate_batch_tokens(texts)
+        
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional translator. You translate text accurately "
+                        "while preserving meaning, tone, and formatting. You always respond "
+                        "with valid JSON containing the translations."
                     )
-                    
-                    return translations, True
-                else:
-                    error_text = await response.text()
-                    raise RuntimeError(f"LM Studio API error {response.status}: {error_text}")
-            
-        except Exception as e:
-            # Retry on errors indefinitely
-            wait_time = min((2 ** retry_count) * 2, 120)  # Cap at 2 minutes
-            self._stats.record_retry()
-            logger.warning(f"Request failed (attempt {retry_count + 1}): {e}, retrying in {wait_time}s")
-            await asyncio.sleep(wait_time)
-            return await self._translate_batch_request(texts, retry_count + 1)
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": -1,
+            "stream": False
+        }
+        
+        session = await self._init_http_session()
+        async with session.post(self.api_url, json=payload) as response:
+            if response.status == 200:
+                result = await response.json()
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                
+                if not content:
+                    raise RuntimeError("Empty response from LM Studio API")
+                
+                # Estimate tokens from usage if available
+                usage = result.get('usage', {})
+                input_tokens = usage.get('prompt_tokens', estimated_tokens)
+                output_tokens = usage.get('completion_tokens', 0)
+                
+                # Parse response
+                translations = self._parse_batch_response(content, texts)
+                
+                elapsed = time.time() - start_time
+                self._stats.record_success(len(texts), input_tokens, output_tokens, elapsed)
+                
+                logger.debug(
+                    f"Batch of {len(texts)} translated in {elapsed:.2f}s "
+                    f"(tokens: {input_tokens}+{output_tokens})"
+                )
+                
+                return translations
+            else:
+                error_text = await response.text()
+                raise RuntimeError(f"LM Studio API error {response.status}: {error_text}")
     
     async def _translate_dict_request(
         self, 
-        items: Dict, 
-        retry_count: int = 0
-    ) -> Tuple[Dict, bool]:
-        """Make a single dictionary translation request."""
+        items: Dict
+    ) -> Dict:
+        """Make a single dictionary translation request (no retries - handled by batch manager)."""
         if not items:
-            return {}, True
+            return {}
         
         start_time = time.time()
         
-        try:
-            prompt = self._create_dict_prompt(items)
-            estimated_tokens = self._estimate_batch_tokens([str(v) for v in items.values() if isinstance(v, str)])
-            
-            payload = {
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a professional translator. You translate JSON files accurately "
-                            "while preserving meaning, tone, formatting, and structure. You always respond "
-                            "with valid JSON containing the translations with the same keys."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": -1,
-                "stream": False
-            }
-            
-            session = await self._init_http_session()
-            async with session.post(self.api_url, json=payload) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    
-                    if not content:
-                        raise RuntimeError("Empty response from LM Studio API")
-                    
-                    # Estimate tokens from usage if available
-                    usage = result.get('usage', {})
-                    input_tokens = usage.get('prompt_tokens', estimated_tokens)
-                    output_tokens = usage.get('completion_tokens', 0)
-                    
-                    # Parse response
-                    translated_dict = self._parse_dict_response(content, items)
-                    
-                    elapsed = time.time() - start_time
-                    item_count = len([v for v in items.values() if isinstance(v, str)])
-                    self._stats.record_success(item_count, input_tokens, output_tokens, elapsed)
-                    
-                    logger.debug(
-                        f"Dict of {len(items)} items translated in {elapsed:.2f}s "
-                        f"(tokens: {input_tokens}+{output_tokens})"
+        prompt = self._create_dict_prompt(items)
+        estimated_tokens = self._estimate_batch_tokens([str(v) for v in items.values() if isinstance(v, str)])
+        
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional translator. You translate JSON files accurately "
+                        "while preserving meaning, tone, formatting, and structure. You always respond "
+                        "with valid JSON containing the translations with the same keys."
                     )
-                    
-                    return translated_dict, True
-                else:
-                    error_text = await response.text()
-                    raise RuntimeError(f"LM Studio API error {response.status}: {error_text}")
-            
-        except Exception as e:
-            # Retry on errors indefinitely
-            wait_time = min((2 ** retry_count) * 2, 120)  # Cap at 2 minutes
-            self._stats.record_retry()
-            logger.warning(f"Request failed (attempt {retry_count + 1}): {e}, retrying in {wait_time}s")
-            await asyncio.sleep(wait_time)
-            return await self._translate_dict_request(items, retry_count + 1)
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": -1,
+            "stream": False
+        }
+        
+        session = await self._init_http_session()
+        async with session.post(self.api_url, json=payload) as response:
+            if response.status == 200:
+                result = await response.json()
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                
+                if not content:
+                    raise RuntimeError("Empty response from LM Studio API")
+                
+                # Estimate tokens from usage if available
+                usage = result.get('usage', {})
+                input_tokens = usage.get('prompt_tokens', estimated_tokens)
+                output_tokens = usage.get('completion_tokens', 0)
+                
+                # Parse response
+                translated_dict, missing_keys = self._parse_dict_response(content, items)
+                
+                # If there are missing keys, raise exception to trigger requeue of entire batch
+                if missing_keys:
+                    raise ValueError(f"Missing translations for {len(missing_keys)} keys: {missing_keys}")
+                
+                elapsed = time.time() - start_time
+                item_count = len([v for v in items.values() if isinstance(v, str)])
+                self._stats.record_success(item_count, input_tokens, output_tokens, elapsed)
+                
+                logger.debug(
+                    f"Dict of {len(items)} items translated in {elapsed:.2f}s "
+                    f"(tokens: {input_tokens}+{output_tokens})"
+                )
+                
+                return translated_dict
+            else:
+                error_text = await response.text()
+                raise RuntimeError(f"LM Studio API error {response.status}: {error_text}")
     
     def _split_into_batches(self, texts: List[str]) -> List[List[str]]:
         """Split texts into batches respecting token limits."""
@@ -412,61 +399,75 @@ Output the translated JSON:"""
     async def translate_batch(self, texts: List[str]) -> List[str]:
         """
         Translate multiple texts with batch optimization and concurrency.
-        
-        Splits texts into optimal batches and processes them concurrently.
+        Uses queue-based batch manager for optimized retry handling.
         """
         if not texts:
             return []
         
-        # Split into batches
-        batches = self._split_into_batches(texts)
+        # Create token-aware batch builder
+        batch_builder = TokenAwareBatchBuilder(
+            max_tokens=MAX_INPUT_TOKENS_PER_REQUEST,
+            estimate_tokens=self._estimate_tokens,
+            max_items=self.items_per_batch,
+        )
         
-        # Create a mapping to reassemble results
-        results = [None] * len(texts)
-        batch_ranges = []
+        # Create batch manager
+        batch_manager = BatchManager(
+            batch_size=self.items_per_batch,
+            max_retries=0,  # Infinite retries
+            batch_builder=batch_builder,
+        )
         
-        start_idx = 0
-        for batch in batches:
-            batch_ranges.append((start_idx, start_idx + len(batch)))
-            start_idx += len(batch)
+        # Add items to queue (using index as key for list results)
+        items = [(str(i), text) for i, text in enumerate(texts)]
+        await batch_manager.add_items(items)
         
-        # Process batches with concurrency control
-        async def process_batch(batch_idx: int):
+        # Process batches
+        async def process_batch(batch: List[BatchItem]):
+            """Process a single batch of items."""
             async with self.semaphore:
-                batch = batches[batch_idx]
-                start, end = batch_ranges[batch_idx]
-                
-                # Retry until successful
-                while True:
-                    translations, success = await self._translate_batch_request(batch)
-                    if success:
-                        for i, translation in enumerate(translations):
-                            results[start + i] = translation
-                        break
-                    # If not successful, retry (shouldn't happen with new retry logic, but keep as safety)
-                    logger.warning(f"Batch {batch_idx} failed, retrying...")
-                    await asyncio.sleep(1)
+                # Extract texts from batch items
+                batch_texts = [item.value for item in batch]
+                # Translate
+                translations = await self._translate_batch_request(batch_texts)
+                return translations
         
-        # Run all batches concurrently (semaphore limits actual concurrency)
-        tasks = [process_batch(i) for i in range(len(batches))]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Process with concurrency control
+        results_dict = await batch_manager.process(
+            processor=process_batch,
+            concurrency=self.concurrency,
+        )
         
-        # Verify all results are present (retry any missing ones)
+        # Convert dict results back to list (preserving order)
+        results = [None] * len(texts)
+        for idx_str, translation in results_dict.items():
+            idx = int(idx_str)
+            if 0 <= idx < len(texts):
+                results[idx] = translation
+        
+        # Verify all results are present
         missing_indices = [i for i, r in enumerate(results) if r is None]
         if missing_indices:
-            logger.warning(f"Retrying {len(missing_indices)} missing translations...")
-            missing_texts = [texts[i] for i in missing_indices]
-            missing_translations = await self.translate_batch(missing_texts)
-            for idx, trans in zip(missing_indices, missing_translations):
-                results[idx] = trans
+            logger.warning(f"Missing translations for {len(missing_indices)} indices, requeuing...")
+            # Requeue missing items
+            for idx in missing_indices:
+                await batch_manager.add_item(str(idx), texts[idx])
+            # Process again
+            additional_results = await batch_manager.process(
+                processor=process_batch,
+                concurrency=self.concurrency,
+            )
+            for idx_str, translation in additional_results.items():
+                idx = int(idx_str)
+                if 0 <= idx < len(texts):
+                    results[idx] = translation
         
         return results
     
     async def translate_batch_dict(self, items: Dict) -> Dict:
         """
         Translate a dictionary of items with batch optimization and concurrency.
-        
-        Splits large dictionaries into optimal batches and processes them concurrently.
+        Uses queue-based batch manager for optimized retry handling.
         """
         if not items:
             return {}
@@ -478,54 +479,55 @@ Output the translated JSON:"""
         if not string_items:
             return items
         
-        # Split into batches
-        batches = self._split_dict_into_batches(string_items)
+        # Create token-aware batch builder
+        batch_builder = TokenAwareBatchBuilder(
+            max_tokens=MAX_INPUT_TOKENS_PER_REQUEST,
+            estimate_tokens=self._estimate_tokens,
+            max_items=self.items_per_batch,
+        )
         
-        # Process batches with concurrency control
-        async def process_batch(batch: Dict):
+        # Create batch manager
+        batch_manager = BatchManager(
+            batch_size=self.items_per_batch,
+            max_retries=0,  # Infinite retries
+            batch_builder=batch_builder,
+        )
+        
+        # Add items to queue
+        await batch_manager.add_items(list(string_items.items()))
+        
+        # Process batches
+        async def process_batch(batch: List[BatchItem]):
+            """Process a single batch of items."""
             async with self.semaphore:
-                translated_dict, success = await self._translate_dict_request(batch)
+                # Convert batch items to dict
+                batch_dict = {item.key: item.value for item in batch}
+                # Translate
+                translated_dict = await self._translate_dict_request(batch_dict)
                 return translated_dict
         
-        # Run all batches concurrently (semaphore limits actual concurrency)
-        tasks = [process_batch(batch) for batch in batches]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Process with concurrency control
+        result = await batch_manager.process(
+            processor=process_batch,
+            concurrency=self.concurrency,
+        )
         
-        # Merge all batch results and retry failed batches
-        result = dict(non_string_items)
-        failed_batches = []
-        for i, batch_result in enumerate(batch_results):
-            if isinstance(batch_result, dict):
-                result.update(batch_result)
-            else:
-                # On exception, retry the batch
-                logger.error(f"Batch translation failed: {batch_result}, will retry")
-                failed_batches.append(i)
+        # Add non-string items back
+        result.update(non_string_items)
         
-        # Retry failed batches
-        while failed_batches:
-            logger.info(f"Retrying {len(failed_batches)} failed batches...")
-            retry_failed = []
-            for batch_idx in failed_batches:
-                batch = batches[batch_idx]
-                try:
-                    translated_dict, success = await self._translate_dict_request(batch)
-                    if success:
-                        result.update(translated_dict)
-                    else:
-                        retry_failed.append(batch_idx)
-                except Exception as e:
-                    logger.error(f"Batch {batch_idx} retry failed: {e}")
-                    retry_failed.append(batch_idx)
-            failed_batches = retry_failed
-        
-        # Verify all original keys are present (retry any missing ones)
-        missing_keys = [key for key in items.keys() if key not in result]
+        # Verify all original keys are present
+        missing_keys = [key for key in string_items.keys() if key not in result]
         if missing_keys:
-            logger.warning(f"Retrying {len(missing_keys)} missing keys...")
-            missing_items = {k: items[k] for k in missing_keys}
-            missing_translated = await self.translate_batch_dict(missing_items)
-            result.update(missing_translated)
+            logger.warning(f"Missing translations for {len(missing_keys)} keys, requeuing...")
+            # Requeue missing items
+            missing_items = [(k, string_items[k]) for k in missing_keys]
+            await batch_manager.add_items(missing_items)
+            # Process again
+            additional_results = await batch_manager.process(
+                processor=process_batch,
+                concurrency=self.concurrency,
+            )
+            result.update(additional_results)
         
         return result
     

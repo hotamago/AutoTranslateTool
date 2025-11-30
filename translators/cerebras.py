@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from .base import BaseTranslator
+from utils.batch_manager import BatchManager, BatchItem, TokenAwareBatchBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -198,8 +199,14 @@ Input JSON:
 Output the translated JSON:"""
         return prompt
     
-    def _parse_batch_response(self, content: str, original_texts: List[str]) -> List[str]:
-        """Parse the batch translation response."""
+    def _parse_batch_response(self, content: str, original_texts: List[str]) -> Tuple[List[str], List[int]]:
+        """Parse the batch translation response.
+        
+        Returns:
+            Tuple of (translations, missing_indices) where translations is a list of
+            translated texts (with None for missing ones) and missing_indices is a list
+            of indices that were not found in the response.
+        """
         # Try to extract JSON from the response
         content = content.strip()
         
@@ -229,12 +236,10 @@ Output the translated JSON:"""
             if key in result:
                 translations.append(result[key])
             else:
+                translations.append(None)
                 missing_indices.append(i)
         
-        if missing_indices:
-            raise ValueError(f"Missing translations for indices: {missing_indices}")
-        
-        return translations
+        return translations, missing_indices
     
     async def _wait_for_rate_limit(self, estimated_tokens: int):
         """Wait if necessary to respect rate limits."""
@@ -250,12 +255,11 @@ Output the translated JSON:"""
     
     async def _translate_batch_request(
         self, 
-        texts: List[str], 
-        retry_count: int = 0
-    ) -> Tuple[List[str], bool]:
-        """Make a single batch translation request. Retries indefinitely until success."""
+        texts: List[str]
+    ) -> List[str]:
+        """Make a single batch translation request (no retries - handled by batch manager)."""
         if not texts:
-            return [], True
+            return []
         
         estimated_tokens = self._estimate_batch_tokens(texts)
         
@@ -264,56 +268,46 @@ Output the translated JSON:"""
         
         start_time = time.time()
         
-        try:
-            prompt = self._create_batch_prompt(texts)
-            
-            # Make the API call synchronously (Cerebras SDK is sync)
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                self.executor,
-                self._make_completion_request,
-                prompt
-            )
-            
-            if response is None:
-                raise RuntimeError("Empty response from Cerebras API")
-            
-            # Record the request for rate limiting
-            input_tokens = response.usage.prompt_tokens if response.usage else estimated_tokens
-            output_tokens = response.usage.completion_tokens if response.usage else 0
-            
-            async with self._rate_lock:
-                self._rate_tracker.record_request(input_tokens + output_tokens)
-            
-            # Parse response
-            content = response.choices[0].message.content
-            translations = self._parse_batch_response(content, texts)
-            
-            elapsed = time.time() - start_time
-            self._stats.record_success(len(texts), input_tokens, output_tokens, elapsed)
-            
-            logger.debug(
-                f"Batch of {len(texts)} translated in {elapsed:.2f}s "
-                f"(tokens: {input_tokens}+{output_tokens})"
-            )
-            
-            return translations, True
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # Check for rate limit errors
-            if "rate" in error_msg or "429" in error_msg or "limit" in error_msg:
-                wait_time = min((2 ** retry_count) * 5, 300)  # Cap at 5 minutes, longer backoff for rate limits
-                logger.warning(f"Rate limited (attempt {retry_count + 1}), waiting {wait_time}s before retry")
-                await asyncio.sleep(wait_time)
-                return await self._translate_batch_request(texts, retry_count + 1)
-            
-            # Retry on other errors indefinitely
-            wait_time = min((2 ** retry_count) * 2, 120)  # Cap at 2 minutes
-            logger.warning(f"Request failed (attempt {retry_count + 1}): {e}, retrying in {wait_time}s")
-            await asyncio.sleep(wait_time)
-            return await self._translate_batch_request(texts, retry_count + 1)
+        prompt = self._create_batch_prompt(texts)
+        
+        # Make the API call synchronously (Cerebras SDK is sync)
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            self.executor,
+            self._make_completion_request,
+            prompt
+        )
+        
+        if response is None:
+            raise RuntimeError("Empty response from Cerebras API")
+        
+        # Record the request for rate limiting
+        input_tokens = response.usage.prompt_tokens if response.usage else estimated_tokens
+        output_tokens = response.usage.completion_tokens if response.usage else 0
+        
+        async with self._rate_lock:
+            self._rate_tracker.record_request(input_tokens + output_tokens)
+        
+        # Parse response
+        content = response.choices[0].message.content
+        translations, missing_indices = self._parse_batch_response(content, texts)
+        
+        # If there are missing indices, raise exception to trigger requeue
+        if missing_indices:
+            logger.warning(f"Missing translations for {len(missing_indices)} indices: {missing_indices}")
+            # Fill None for missing indices - they will be requeued by batch manager
+            for idx in missing_indices:
+                translations[idx] = None
+        
+        elapsed = time.time() - start_time
+        self._stats.record_success(len(texts), input_tokens, output_tokens, elapsed)
+        
+        logger.debug(
+            f"Batch of {len(texts)} translated in {elapsed:.2f}s "
+            f"(tokens: {input_tokens}+{output_tokens})"
+        )
+        
+        return translations
     
     def _make_completion_request(self, prompt: str):
         """Make a synchronous completion request (called from executor)."""
@@ -365,9 +359,7 @@ Output the translated JSON:"""
     async def translate_batch(self, texts: List[str]) -> List[str]:
         """
         Translate multiple texts with batch optimization and concurrency.
-        
-        Splits texts into optimal batches and processes them concurrently
-        while respecting rate limits.
+        Uses queue-based batch manager for optimized retry handling.
         """
         if not texts:
             return []
@@ -375,48 +367,63 @@ Output the translated JSON:"""
         if self._client is None:
             await self.initialize()
         
-        # Split into batches
-        batches = self._split_into_batches(texts)
-        # logger.info(f"Processing {len(texts)} texts in {len(batches)} batches")
+        # Create token-aware batch builder
+        batch_builder = TokenAwareBatchBuilder(
+            max_tokens=MAX_INPUT_TOKENS_PER_REQUEST,
+            estimate_tokens=self._estimate_tokens,
+            max_items=self.items_per_batch,
+        )
         
-        # Create a mapping to reassemble results
-        results = [None] * len(texts)
-        batch_ranges = []
+        # Create batch manager
+        batch_manager = BatchManager(
+            batch_size=self.items_per_batch,
+            max_retries=0,  # Infinite retries
+            batch_builder=batch_builder,
+        )
         
-        start_idx = 0
-        for batch in batches:
-            batch_ranges.append((start_idx, start_idx + len(batch)))
-            start_idx += len(batch)
+        # Add items to queue (using index as key for list results)
+        items = [(str(i), text) for i, text in enumerate(texts)]
+        await batch_manager.add_items(items)
         
-        # Process batches with concurrency control
-        async def process_batch(batch_idx: int):
+        # Process batches
+        async def process_batch(batch: List[BatchItem]):
+            """Process a single batch of items."""
             async with self.semaphore:
-                batch = batches[batch_idx]
-                start, end = batch_ranges[batch_idx]
-                
-                # Retry until successful
-                while True:
-                    translations, success = await self._translate_batch_request(batch)
-                    if success:
-                        for i, translation in enumerate(translations):
-                            results[start + i] = translation
-                        break
-                    # If not successful, retry (shouldn't happen with new retry logic, but keep as safety)
-                    logger.warning(f"Batch {batch_idx} failed, retrying...")
-                    await asyncio.sleep(1)
+                # Extract texts from batch items
+                batch_texts = [item.value for item in batch]
+                # Translate
+                translations = await self._translate_batch_request(batch_texts)
+                return translations
         
-        # Run all batches concurrently (semaphore limits actual concurrency)
-        tasks = [process_batch(i) for i in range(len(batches))]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # Process with concurrency control
+        results_dict = await batch_manager.process(
+            processor=process_batch,
+            concurrency=self.concurrency,
+        )
         
-        # Verify all results are present (retry any missing ones)
+        # Convert dict results back to list (preserving order)
+        results = [None] * len(texts)
+        for idx_str, translation in results_dict.items():
+            idx = int(idx_str)
+            if 0 <= idx < len(texts):
+                results[idx] = translation
+        
+        # Verify all results are present
         missing_indices = [i for i, r in enumerate(results) if r is None]
         if missing_indices:
-            logger.warning(f"Retrying {len(missing_indices)} missing translations...")
-            missing_texts = [texts[i] for i in missing_indices]
-            missing_translations = await self.translate_batch(missing_texts)
-            for idx, trans in zip(missing_indices, missing_translations):
-                results[idx] = trans
+            logger.warning(f"Missing translations for {len(missing_indices)} indices, requeuing...")
+            # Requeue missing items
+            for idx in missing_indices:
+                await batch_manager.add_item(str(idx), texts[idx])
+            # Process again
+            additional_results = await batch_manager.process(
+                processor=process_batch,
+                concurrency=self.concurrency,
+            )
+            for idx_str, translation in additional_results.items():
+                idx = int(idx_str)
+                if 0 <= idx < len(texts):
+                    results[idx] = translation
         
         return results
     
