@@ -388,7 +388,7 @@ Output the translated JSON:"""
         
         # Split into batches
         batches = self._split_into_batches(texts)
-        logger.info(f"Processing {len(texts)} texts in {len(batches)} batches")
+        # logger.info(f"Processing {len(texts)} texts in {len(batches)} batches")
         
         # Create a mapping to reassemble results
         results = [None] * len(texts)
