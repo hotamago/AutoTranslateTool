@@ -12,6 +12,7 @@ from translators import (
     BingTranslatorService,
     LMStudioTranslatorService,
     CerebrasTranslatorService,
+    NvidiaOpenAITranslatorService,
 )
 from utils.cache import load_cache, append_to_cache, append_batch_to_cache, BatchCacheWriter
 from utils.file_handler import load_json_file, save_json_file, finalize_output
@@ -30,6 +31,8 @@ class TranslationManager:
         target_lang: str,
         service_concurrency: Optional[Dict[str, int]] = None,
         api_key: Optional[str] = None,
+        api_key_cerebras: Optional[str] = None,
+        api_key_nvidia: Optional[str] = None,
         service_batch_size: Optional[Dict[str, int]] = None,
         ignore_patterns: Optional[List[str]] = None,
         # Backward compatibility parameters
@@ -46,6 +49,8 @@ class TranslationManager:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.api_key = api_key
+        self.api_key_cerebras = api_key_cerebras
+        self.api_key_nvidia = api_key_nvidia
         
         # Handle per-service configurations with backward compatibility
         if service_concurrency is None:
@@ -111,8 +116,16 @@ class TranslationManager:
                     self.source_lang, self.target_lang, concurrency, self.api_key, items_per_batch=batch_size
                 )
             elif service == 'cerebras':
+                # Use service-specific API key if provided, otherwise fall back to general api_key
+                cerebras_api_key = self.api_key_cerebras or self.api_key
                 self.translators[service] = CerebrasTranslatorService(
-                    self.source_lang, self.target_lang, concurrency, self.api_key, items_per_batch=batch_size
+                    self.source_lang, self.target_lang, concurrency, cerebras_api_key, items_per_batch=batch_size
+                )
+            elif service == 'nvidia' or service == 'nvidia-openai':
+                # Use service-specific API key if provided, otherwise fall back to general api_key
+                nvidia_api_key = self.api_key_nvidia or self.api_key
+                self.translators[service] = NvidiaOpenAITranslatorService(
+                    self.source_lang, self.target_lang, concurrency, nvidia_api_key, items_per_batch=batch_size
                 )
             else:
                 logger.warning(f"Service '{service}' not explicitly supported. Defaulting to Google.")
@@ -195,6 +208,8 @@ class TranslationManager:
                     await self._process_google_optimized(pending_items, cache_file, translator)
                 elif service == 'cerebras':
                     await self._process_cerebras(pending_items, cache_file, translator)
+                elif service == 'nvidia' or service == 'nvidia-openai':
+                    await self._process_nvidia(pending_items, cache_file, translator)
                 else:
                     await self._process_individual(pending_items, cache_file, translator)
         finally:
@@ -246,6 +261,20 @@ class TranslationManager:
                 'speed_factor': 0.9,          # Fast
                 'supports_batch': False,
                 'preferred_item_size': 'small'  # Good for many small items
+            },
+            'nvidia': {
+                'preferred_batch_size': 50,   # Medium batches
+                'concurrency_factor': 0.6,     # Moderate concurrency
+                'speed_factor': 0.7,          # Good speed
+                'supports_batch': True,
+                'preferred_item_size': 'medium'  # Good for medium batches
+            },
+            'nvidia-openai': {
+                'preferred_batch_size': 50,   # Medium batches
+                'concurrency_factor': 0.6,     # Moderate concurrency
+                'speed_factor': 0.7,          # Good speed
+                'supports_batch': True,
+                'preferred_item_size': 'medium'  # Good for medium batches
             }
         }
         return characteristics.get(service, {
@@ -423,6 +452,20 @@ class TranslationManager:
                             
                     elif service == 'cerebras':
                         # Cerebras: process in batches
+                        # Use configured batch_size or fall back to preferred
+                        batch_size = self.service_batch_size.get(service, service_chars['preferred_batch_size'])
+                        for batch_start in range(0, len(task_values), batch_size):
+                            batch_end = min(batch_start + batch_size, len(task_values))
+                            batch_values = task_values[batch_start:batch_end]
+                            batch_keys = task_keys[batch_start:batch_end]
+                            
+                            translated_values = await translator.translate_batch(batch_values)
+                            cache_items = [(k, v) for k, v in zip(batch_keys, translated_values)]
+                            await cache_writer.add_batch(cache_items)
+                            pbar.update(len(cache_items))
+                            
+                    elif service == 'nvidia' or service == 'nvidia-openai':
+                        # NVIDIA OpenAI: process in batches
                         # Use configured batch_size or fall back to preferred
                         batch_size = self.service_batch_size.get(service, service_chars['preferred_batch_size'])
                         for batch_start in range(0, len(task_values), batch_size):
@@ -667,6 +710,84 @@ class TranslationManager:
         if hasattr(translator, 'get_stats'):
             stats = translator.get_stats()
             logger.info(f"Cerebras translation stats: {stats}")
+    
+    async def _process_nvidia(self, pending_items: Dict, cache_file: str, translator):
+        """
+        Process items using NVIDIA OpenAI with batch optimization.
+        Uses batch translation within single API calls + concurrent requests.
+        """
+        keys = list(pending_items.keys())
+        values = [pending_items[k] for k in keys]
+        
+        # Separate items to translate from ignored items
+        to_translate_indices: List[int] = []
+        to_translate_values: List[str] = []
+        ignored_items: List[Tuple[str, str]] = []
+        
+        for idx, (key, val) in enumerate(zip(keys, values)):
+            if isinstance(val, str):
+                if self._should_ignore(val):
+                    ignored_items.append((key, val))
+                else:
+                    to_translate_indices.append(idx)
+                    to_translate_values.append(val)
+            else:
+                ignored_items.append((key, val))
+        
+        logger.info(
+            f"NVIDIA OpenAI: Processing {len(to_translate_values)} items to translate, "
+            f"{len(ignored_items)} ignored/non-string items"
+        )
+        
+        # Write ignored items in batch
+        if ignored_items:
+            await append_batch_to_cache(cache_file, ignored_items)
+        
+        if not to_translate_values:
+            return
+        
+        # Initialize cache writer with appropriate buffer size
+        cache_writer = BatchCacheWriter(
+            cache_file,
+            buffer_size=min(200, len(to_translate_values) // 4 + 1),
+            flush_interval=3.0
+        )
+        await cache_writer.start()
+        
+        try:
+            # Process in larger chunks to leverage batch API efficiency
+            chunk_size = self.batch_size
+            
+            with tqdm(
+                total=len(to_translate_values),
+                desc="Translating (NVIDIA OpenAI)",
+                unit="item"
+            ) as pbar:
+                for chunk_start in range(0, len(to_translate_values), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(to_translate_values))
+                    chunk_values = to_translate_values[chunk_start:chunk_end]
+                    chunk_indices = to_translate_indices[chunk_start:chunk_end]
+                    
+                    # Translate chunk using batch method (internally handles batching)
+                    translated_values = await translator.translate_batch(chunk_values)
+                    
+                    # Prepare cache items
+                    cache_items = []
+                    for idx, translated in zip(chunk_indices, translated_values):
+                        key = keys[idx]
+                        cache_items.append((key, translated))
+                    
+                    # Add to buffered cache writer
+                    await cache_writer.add_batch(cache_items)
+                    
+                    pbar.update(len(chunk_values))
+        finally:
+            await cache_writer.stop()
+        
+        # Print stats
+        if hasattr(translator, 'get_stats'):
+            stats = translator.get_stats()
+            logger.info(f"NVIDIA OpenAI translation stats: {stats}")
     
     async def _process_individual(self, pending_items: Dict, cache_file: str, translator):
         """Process items individually (for services like Bing)."""

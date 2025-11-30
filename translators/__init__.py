@@ -5,6 +5,7 @@ from .google import GoogleTranslatorService
 from .bing import BingTranslatorService
 from .lmstudio import LMStudioTranslatorService
 from .cerebras import CerebrasTranslatorService
+from .nvidia import NvidiaOpenAITranslatorService
 
 __all__ = [
     'BaseTranslator',
@@ -12,5 +13,6 @@ __all__ = [
     'BingTranslatorService',
     'LMStudioTranslatorService',
     'CerebrasTranslatorService',
+    'NvidiaOpenAITranslatorService',
 ]
 

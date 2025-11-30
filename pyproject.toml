@@ -11,4 +11,5 @@ dependencies = [
     "aiofiles>=24.1.0",
     "aiohttp>=3.11.7",
     "cerebras-cloud-sdk>=1.59.0",
+    "openai>=1.0.0",
 ]

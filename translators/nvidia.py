@@ -1,11 +1,11 @@
-"""Cerebras LLM translation service implementation with batch and concurrent optimization."""
+"""NVIDIA OpenAI translation service implementation with batch and concurrent optimization."""
 
 import asyncio
 import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -14,70 +14,12 @@ from utils.batch_manager import BatchManager, BatchItem, TokenAwareBatchBuilder
 
 logger = logging.getLogger(__name__)
 
-# Cerebras rate limits for llama-3.3-70b
-RATE_LIMITS = {
-    "requests_per_minute": 30,
-    "tokens_per_minute": 64_000,
-    "requests_per_hour": 900,
-    "requests_per_day": 14_400,
-}
-
 # Estimated tokens per character (conservative estimate for mixed content)
 CHARS_PER_TOKEN = 3.5
 # Max tokens to use per request (leaving room for response)
 MAX_INPUT_TOKENS_PER_REQUEST = 8_000
 # Max items to batch in a single request
 MAX_ITEMS_PER_BATCH = 200
-
-
-@dataclass
-class RateLimitTracker:
-    """Track rate limits across different time windows."""
-    minute_requests: List[float] = field(default_factory=list)
-    minute_tokens: List[Tuple[float, int]] = field(default_factory=list)
-    hour_requests: List[float] = field(default_factory=list)
-    
-    def _clean_old_entries(self, current_time: float):
-        """Remove entries older than their respective windows."""
-        minute_ago = current_time - 60
-        hour_ago = current_time - 3600
-        
-        self.minute_requests = [t for t in self.minute_requests if t > minute_ago]
-        self.minute_tokens = [(t, tokens) for t, tokens in self.minute_tokens if t > minute_ago]
-        self.hour_requests = [t for t in self.hour_requests if t > hour_ago]
-    
-    def can_make_request(self, estimated_tokens: int) -> Tuple[bool, float]:
-        """Check if we can make a request and return wait time if not."""
-        current_time = time.time()
-        self._clean_old_entries(current_time)
-        
-        # Check minute request limit
-        if len(self.minute_requests) >= RATE_LIMITS["requests_per_minute"]:
-            oldest = min(self.minute_requests)
-            wait_time = 60 - (current_time - oldest) + 0.5
-            return False, max(0, wait_time)
-        
-        # Check minute token limit
-        current_minute_tokens = sum(tokens for _, tokens in self.minute_tokens)
-        if current_minute_tokens + estimated_tokens > RATE_LIMITS["tokens_per_minute"]:
-            oldest = min(t for t, _ in self.minute_tokens) if self.minute_tokens else current_time
-            wait_time = 60 - (current_time - oldest) + 0.5
-            return False, max(0, wait_time)
-        
-        # Check hour request limit
-        if len(self.hour_requests) >= RATE_LIMITS["requests_per_hour"]:
-            oldest = min(self.hour_requests)
-            wait_time = 3600 - (current_time - oldest) + 1
-            return False, max(0, wait_time)
-        
-        return True, 0
-    
-    def record_request(self, tokens_used: int):
-        """Record a completed request."""
-        current_time = time.time()
-        self.minute_requests.append(current_time)
-        self.minute_tokens.append((current_time, tokens_used))
-        self.hour_requests.append(current_time)
 
 
 @dataclass
@@ -89,7 +31,7 @@ class TranslationStats:
     failed_items: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
-    rate_limit_waits: int = 0
+    retry_count: int = 0
     avg_response_time: float = 0.0
     
     def record_success(self, items_count: int, input_tokens: int, output_tokens: int, response_time: float):
@@ -109,70 +51,77 @@ class TranslationStats:
         self.total_items += items_count
         self.failed_items += items_count
     
-    def record_rate_limit_wait(self):
-        self.rate_limit_waits += 1
+    def record_retry(self):
+        self.retry_count += 1
 
 
-class CerebrasTranslatorService(BaseTranslator):
+class NvidiaOpenAITranslatorService(BaseTranslator):
     """
-    Cerebras LLM translation service with batch and concurrent optimization.
+    NVIDIA OpenAI translation service with batch and concurrent optimization.
     
     Features:
     - Batch multiple texts in single API request for efficiency
-    - Concurrent requests with rate limiting
+    - Concurrent requests with semaphore control
     - Token-aware batching to respect API limits
     - Automatic retry with exponential backoff
+    - Uses OpenAI SDK with NVIDIA's base URL
     """
     
     def __init__(
         self,
         source_lang: str,
         target_lang: str,
-        concurrency: int = 5,  # Conservative default due to rate limits
+        concurrency: int = 10,
         api_key: Optional[str] = None,
-        model: str = "llama-3.3-70b",
+        base_url: str = "https://integrate.api.nvidia.com/v1",
+        model: str = "moonshotai/kimi-k2-instruct-0905",
         max_retries: int = 3,
-        items_per_batch: int = 30,  # Items to translate per API call
+        items_per_batch: int = 50,  # Items to translate per API call
     ):
         super().__init__(source_lang, target_lang, concurrency, api_key)
+        self.base_url = base_url
         self.model = model
         self.max_retries = max_retries
         self.items_per_batch = min(items_per_batch, MAX_ITEMS_PER_BATCH)
         
         # Use API key from env if not provided
-        self.api_key = api_key or os.environ.get("CEREBRAS_API_KEY")
-        
-        # Rate limiting
-        self._rate_tracker = RateLimitTracker()
-        self._rate_lock = asyncio.Lock()
+        self.api_key = api_key or os.environ.get("NVIDIA_API_KEY")
+        if not self.api_key:
+            raise ValueError("NVIDIA_API_KEY must be provided either as parameter or environment variable")
         
         # Stats tracking
         self._stats = TranslationStats()
         
-        # Cerebras client (initialized lazily)
+        # OpenAI client (initialized lazily)
         self._client = None
         
         # Load prompts from files
         prompts_dir = Path(__file__).parent.parent / "prompts"
-        self._batch_prompt_template = (prompts_dir / "cerebras_batch_prompt.txt").read_text(encoding="utf-8")
-        self._system_batch = (prompts_dir / "cerebras_system_batch.txt").read_text(encoding="utf-8").strip()
+        self._batch_prompt_template = (prompts_dir / "nvidia_batch_prompt.txt").read_text(encoding="utf-8")
+        self._dict_prompt_template = (prompts_dir / "nvidia_dict_prompt.txt").read_text(encoding="utf-8")
+        self._system_batch = (prompts_dir / "nvidia_system_batch.txt").read_text(encoding="utf-8").strip()
+        self._system_dict = (prompts_dir / "nvidia_system_dict.txt").read_text(encoding="utf-8").strip()
     
     async def initialize(self):
-        """Initialize the Cerebras client."""
+        """Initialize NVIDIA OpenAI translator."""
         if self._client is None:
             try:
-                from cerebras.cloud.sdk import Cerebras
-                self._client = Cerebras(api_key=self.api_key)
+                from openai import OpenAI
+                self._client = OpenAI(
+                    base_url=self.base_url,
+                    api_key=self.api_key
+                )
                 logger.info(
-                    f"Cerebras translator initialized: model={self.model}, "
-                    f"concurrency={self.concurrency}, items_per_batch={self.items_per_batch}"
+                    f"NVIDIA OpenAI translator initialized: model={self.model}, "
+                    f"base_url={self.base_url}, concurrency={self.concurrency}, "
+                    f"items_per_batch={self.items_per_batch}"
                 )
             except ImportError:
                 raise ImportError(
-                    "cerebras-cloud-sdk is required. Install with: pip install cerebras-cloud-sdk"
+                    "openai package is required. Install with: pip install openai"
                 )
             except Exception as e:
-                raise RuntimeError(f"Failed to initialize Cerebras client: {e}")
+                raise RuntimeError(f"Failed to initialize NVIDIA OpenAI client: {e}")
     
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count for a text."""
@@ -196,14 +145,16 @@ class CerebrasTranslatorService(BaseTranslator):
             items_json=json.dumps(items_json, ensure_ascii=False, indent=2)
         )
     
-    def _parse_batch_response(self, content: str, original_texts: List[str]) -> Tuple[List[str], List[int]]:
-        """Parse the batch translation response.
-        
-        Returns:
-            Tuple of (translations, missing_indices) where translations is a list of
-            translated texts (with None for missing ones) and missing_indices is a list
-            of indices that were not found in the response.
-        """
+    def _create_dict_prompt(self, items: Dict) -> str:
+        """Create a prompt for dictionary translation."""
+        return self._dict_prompt_template.format(
+            source_lang=self.source_lang,
+            target_lang=self.target_lang,
+            items_json=json.dumps(items, ensure_ascii=False, indent=2)
+        )
+    
+    def _parse_batch_response(self, content: str, original_texts: List[str]) -> List[str]:
+        """Parse the batch translation response."""
         # Try to extract JSON from the response
         content = content.strip()
         
@@ -233,22 +184,45 @@ class CerebrasTranslatorService(BaseTranslator):
             if key in result:
                 translations.append(result[key])
             else:
-                translations.append(None)
                 missing_indices.append(i)
         
-        return translations, missing_indices
+        if missing_indices:
+            raise ValueError(f"Missing translations for indices: {missing_indices}")
+        
+        return translations
     
-    async def _wait_for_rate_limit(self, estimated_tokens: int):
-        """Wait if necessary to respect rate limits."""
-        async with self._rate_lock:
-            while True:
-                can_proceed, wait_time = self._rate_tracker.can_make_request(estimated_tokens)
-                if can_proceed:
-                    break
-                
-                self._stats.record_rate_limit_wait()
-                logger.debug(f"Rate limit reached, waiting {wait_time:.1f}s")
-                await asyncio.sleep(wait_time)
+    def _parse_dict_response(self, content: str, original_items: Dict) -> Tuple[Dict, List[str]]:
+        """Parse the dictionary translation response.
+        
+        Returns:
+            Tuple of (translated_dict, missing_keys) where missing_keys is a list of keys
+            that were not found in the response.
+        """
+        # Try to extract JSON from the response
+        content = content.strip()
+        
+        # Handle markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            parts = content.split("```")
+            if len(parts) >= 2:
+                content = parts[1].strip()
+        
+        # Find JSON object boundaries
+        start = content.find('{')
+        end = content.rfind('}')
+        
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("No valid JSON object found in response")
+        
+        json_str = content[start:end + 1]
+        result = json.loads(json_str)
+        
+        # Check for missing keys
+        missing_keys = [key for key in original_items.keys() if key not in result]
+        
+        return result, missing_keys
     
     async def _translate_batch_request(
         self, 
@@ -258,16 +232,15 @@ class CerebrasTranslatorService(BaseTranslator):
         if not texts:
             return []
         
-        estimated_tokens = self._estimate_batch_tokens(texts)
-        
-        # Wait for rate limit
-        await self._wait_for_rate_limit(estimated_tokens)
+        if self._client is None:
+            await self.initialize()
         
         start_time = time.time()
         
         prompt = self._create_batch_prompt(texts)
+        estimated_tokens = self._estimate_batch_tokens(texts)
         
-        # Make the API call synchronously (Cerebras SDK is sync)
+        # Make the API call synchronously (OpenAI SDK is sync)
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             self.executor,
@@ -276,25 +249,21 @@ class CerebrasTranslatorService(BaseTranslator):
         )
         
         if response is None:
-            raise RuntimeError("Empty response from Cerebras API")
+            raise RuntimeError("Empty response from NVIDIA OpenAI API")
         
-        # Record the request for rate limiting
-        input_tokens = response.usage.prompt_tokens if response.usage else estimated_tokens
-        output_tokens = response.usage.completion_tokens if response.usage else 0
+        # Extract content
+        content = response.choices[0].message.content
         
-        async with self._rate_lock:
-            self._rate_tracker.record_request(input_tokens + output_tokens)
+        if not content:
+            raise RuntimeError("Empty response content from NVIDIA OpenAI API")
+        
+        # Estimate tokens from usage if available
+        usage = response.usage
+        input_tokens = usage.prompt_tokens if usage else estimated_tokens
+        output_tokens = usage.completion_tokens if usage else 0
         
         # Parse response
-        content = response.choices[0].message.content
-        translations, missing_indices = self._parse_batch_response(content, texts)
-        
-        # If there are missing indices, raise exception to trigger requeue
-        if missing_indices:
-            logger.warning(f"Missing translations for {len(missing_indices)} indices: {missing_indices}")
-            # Fill None for missing indices - they will be requeued by batch manager
-            for idx in missing_indices:
-                translations[idx] = None
+        translations = self._parse_batch_response(content, texts)
         
         elapsed = time.time() - start_time
         self._stats.record_success(len(texts), input_tokens, output_tokens, elapsed)
@@ -309,6 +278,7 @@ class CerebrasTranslatorService(BaseTranslator):
     def _make_completion_request(self, prompt: str):
         """Make a synchronous completion request (called from executor)."""
         return self._client.chat.completions.create(
+            model=self.model,
             messages=[
                 {
                     "role": "system",
@@ -319,35 +289,87 @@ class CerebrasTranslatorService(BaseTranslator):
                     "content": prompt
                 }
             ],
-            model=self.model,
-            temperature=0.3,
-            max_tokens=8192,
+            temperature=0.6,
+            top_p=0.9,
+            max_tokens=4096,
+            stream=False
         )
     
-    def _split_into_batches(self, texts: List[str]) -> List[List[str]]:
-        """Split texts into batches respecting token limits."""
-        batches = []
-        current_batch = []
-        current_tokens = 200  # Base overhead
+    async def _translate_dict_request(
+        self, 
+        items: Dict
+    ) -> Dict:
+        """Make a single dictionary translation request (no retries - handled by batch manager)."""
+        if not items:
+            return {}
         
-        for text in texts:
-            text_tokens = self._estimate_tokens(text) + 20  # Per-item overhead
-            
-            # Check if adding this text would exceed limits
-            if (len(current_batch) >= self.items_per_batch or 
-                current_tokens + text_tokens > MAX_INPUT_TOKENS_PER_REQUEST):
-                if current_batch:
-                    batches.append(current_batch)
-                current_batch = [text]
-                current_tokens = 200 + text_tokens
-            else:
-                current_batch.append(text)
-                current_tokens += text_tokens
+        if self._client is None:
+            await self.initialize()
         
-        if current_batch:
-            batches.append(current_batch)
+        start_time = time.time()
         
-        return batches
+        prompt = self._create_dict_prompt(items)
+        estimated_tokens = self._estimate_batch_tokens([str(v) for v in items.values() if isinstance(v, str)])
+        
+        # Make the API call synchronously (OpenAI SDK is sync)
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            self.executor,
+            self._make_dict_completion_request,
+            prompt
+        )
+        
+        if response is None:
+            raise RuntimeError("Empty response from NVIDIA OpenAI API")
+        
+        # Extract content
+        content = response.choices[0].message.content
+        
+        if not content:
+            raise RuntimeError("Empty response content from NVIDIA OpenAI API")
+        
+        # Estimate tokens from usage if available
+        usage = response.usage
+        input_tokens = usage.prompt_tokens if usage else estimated_tokens
+        output_tokens = usage.completion_tokens if usage else 0
+        
+        # Parse response
+        translated_dict, missing_keys = self._parse_dict_response(content, items)
+        
+        # If there are missing keys, raise exception to trigger requeue of entire batch
+        if missing_keys:
+            raise ValueError(f"Missing translations for {len(missing_keys)} keys: {missing_keys}")
+        
+        elapsed = time.time() - start_time
+        item_count = len([v for v in items.values() if isinstance(v, str)])
+        self._stats.record_success(item_count, input_tokens, output_tokens, elapsed)
+        
+        logger.debug(
+            f"Dict of {len(items)} items translated in {elapsed:.2f}s "
+            f"(tokens: {input_tokens}+{output_tokens})"
+        )
+        
+        return translated_dict
+    
+    def _make_dict_completion_request(self, prompt: str):
+        """Make a synchronous completion request for dictionary translation (called from executor)."""
+        return self._client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": self._system_dict
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.6,
+            top_p=0.9,
+            max_tokens=4096,
+            stream=False
+        )
     
     async def translate_batch(self, texts: List[str]) -> List[str]:
         """
@@ -421,27 +443,72 @@ class CerebrasTranslatorService(BaseTranslator):
         return results
     
     async def translate_batch_dict(self, items: Dict) -> Dict:
-        """Translate a dictionary of items."""
+        """
+        Translate a dictionary of items with batch optimization and concurrency.
+        Uses queue-based batch manager for optimized retry handling.
+        """
         if not items:
             return {}
         
-        keys = list(items.keys())
-        values = [items[k] for k in keys]
+        if self._client is None:
+            await self.initialize()
         
-        # Filter only string values
-        string_indices = [i for i, v in enumerate(values) if isinstance(v, str)]
-        string_values = [values[i] for i in string_indices]
+        # Filter only string values for translation
+        string_items = {k: v for k, v in items.items() if isinstance(v, str)}
+        non_string_items = {k: v for k, v in items.items() if not isinstance(v, str)}
         
-        if not string_values:
+        if not string_items:
             return items
         
-        # Translate strings
-        translations = await self.translate_batch(string_values)
+        # Create token-aware batch builder
+        batch_builder = TokenAwareBatchBuilder(
+            max_tokens=MAX_INPUT_TOKENS_PER_REQUEST,
+            estimate_tokens=self._estimate_tokens,
+            max_items=self.items_per_batch,
+        )
         
-        # Reassemble result
-        result = dict(items)
-        for idx, trans in zip(string_indices, translations):
-            result[keys[idx]] = trans
+        # Create batch manager
+        batch_manager = BatchManager(
+            batch_size=self.items_per_batch,
+            max_retries=0,  # Infinite retries
+            batch_builder=batch_builder,
+        )
+        
+        # Add items to queue
+        await batch_manager.add_items(list(string_items.items()))
+        
+        # Process batches
+        async def process_batch(batch: List[BatchItem]):
+            """Process a single batch of items."""
+            async with self.semaphore:
+                # Convert batch items to dict
+                batch_dict = {item.key: item.value for item in batch}
+                # Translate
+                translated_dict = await self._translate_dict_request(batch_dict)
+                return translated_dict
+        
+        # Process with concurrency control
+        result = await batch_manager.process(
+            processor=process_batch,
+            concurrency=self.concurrency,
+        )
+        
+        # Add non-string items back
+        result.update(non_string_items)
+        
+        # Verify all original keys are present
+        missing_keys = [key for key in string_items.keys() if key not in result]
+        if missing_keys:
+            logger.warning(f"Missing translations for {len(missing_keys)} keys, requeuing...")
+            # Requeue missing items
+            missing_items = [(k, string_items[k]) for k in missing_keys]
+            await batch_manager.add_items(missing_items)
+            # Process again
+            additional_results = await batch_manager.process(
+                processor=process_batch,
+                concurrency=self.concurrency,
+            )
+            result.update(additional_results)
         
         return result
     
@@ -455,7 +522,7 @@ class CerebrasTranslatorService(BaseTranslator):
             'success_rate': f"{(self._stats.successful_items / max(1, self._stats.total_items)):.2%}",
             'total_input_tokens': self._stats.total_input_tokens,
             'total_output_tokens': self._stats.total_output_tokens,
-            'rate_limit_waits': self._stats.rate_limit_waits,
+            'retry_count': self._stats.retry_count,
             'avg_response_time': f"{self._stats.avg_response_time:.3f}s",
         }
     
@@ -465,10 +532,9 @@ class CerebrasTranslatorService(BaseTranslator):
         
         if self._stats.total_requests > 0:
             logger.info(
-                f"Cerebras stats: {self._stats.successful_items}/{self._stats.total_items} items "
+                f"NVIDIA OpenAI stats: {self._stats.successful_items}/{self._stats.total_items} items "
                 f"({(self._stats.successful_items / max(1, self._stats.total_items)):.1%} success), "
                 f"tokens: {self._stats.total_input_tokens}+{self._stats.total_output_tokens}, "
-                f"rate waits: {self._stats.rate_limit_waits}"
+                f"retries: {self._stats.retry_count}"
             )
-
 

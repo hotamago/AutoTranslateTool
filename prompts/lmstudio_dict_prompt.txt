@@ -1,0 +1,15 @@
+Translate the following JSON content from {source_lang} to {target_lang}.
+
+IMPORTANT RULES:
+- Return ONLY a valid JSON object with the same keys
+- Preserve the exact meaning and tone
+- Keep special characters, punctuation, and formatting
+- Do not add explanations or comments
+- Maintain the exact structure and keys
+- You must translate
+
+Input JSON:
+{items_json}
+
+Output the translated JSON:
+

@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .base import BaseTranslator
@@ -81,6 +82,13 @@ class LMStudioTranslatorService(BaseTranslator):
         
         # Stats tracking
         self._stats = TranslationStats()
+        
+        # Load prompts from files
+        prompts_dir = Path(__file__).parent.parent / "prompts"
+        self._batch_prompt_template = (prompts_dir / "lmstudio_batch_prompt.txt").read_text(encoding="utf-8")
+        self._dict_prompt_template = (prompts_dir / "lmstudio_dict_prompt.txt").read_text(encoding="utf-8")
+        self._system_batch = (prompts_dir / "lmstudio_system_batch.txt").read_text(encoding="utf-8").strip()
+        self._system_dict = (prompts_dir / "lmstudio_system_dict.txt").read_text(encoding="utf-8").strip()
     
     async def initialize(self):
         """Initialize LM Studio translator."""
@@ -106,38 +114,19 @@ class LMStudioTranslatorService(BaseTranslator):
         # Use indexed format for reliable parsing
         items_json = {str(i): text for i, text in enumerate(texts)}
         
-        prompt = f"""Translate the following texts from {self.source_lang} to {self.target_lang}.
-
-IMPORTANT RULES:
-1. Return ONLY a valid JSON object with the same keys
-2. Preserve the exact meaning and tone
-3. Keep special characters, punctuation, and formatting
-4. Do not add explanations or comments
-5. If a text cannot be translated, return it unchanged
-
-Input JSON:
-{json.dumps(items_json, ensure_ascii=False, indent=2)}
-
-Output the translated JSON:"""
-        return prompt
+        return self._batch_prompt_template.format(
+            source_lang=self.source_lang,
+            target_lang=self.target_lang,
+            items_json=json.dumps(items_json, ensure_ascii=False, indent=2)
+        )
     
     def _create_dict_prompt(self, items: Dict) -> str:
         """Create a prompt for dictionary translation."""
-        prompt = f"""Translate the following JSON content from {self.source_lang} to {self.target_lang}.
-
-IMPORTANT RULES:
-1. Return ONLY a valid JSON object with the same keys
-2. Preserve the exact meaning and tone
-3. Keep special characters, punctuation, and formatting
-4. Do not add explanations or comments
-5. If a text cannot be translated, return it unchanged
-6. Maintain the exact structure and keys
-
-Input JSON:
-{json.dumps(items, ensure_ascii=False, indent=2)}
-
-Output the translated JSON:"""
-        return prompt
+        return self._dict_prompt_template.format(
+            source_lang=self.source_lang,
+            target_lang=self.target_lang,
+            items_json=json.dumps(items, ensure_ascii=False, indent=2)
+        )
     
     def _parse_batch_response(self, content: str, original_texts: List[str]) -> List[str]:
         """Parse the batch translation response."""
@@ -227,18 +216,14 @@ Output the translated JSON:"""
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a professional translator. You translate text accurately "
-                        "while preserving meaning, tone, and formatting. You always respond "
-                        "with valid JSON containing the translations."
-                    )
+                    "content": self._system_batch
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "temperature": 0.3,
+            "temperature": 0.8,
             "max_tokens": -1,
             "stream": False
         }
@@ -290,11 +275,7 @@ Output the translated JSON:"""
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a professional translator. You translate JSON files accurately "
-                        "while preserving meaning, tone, formatting, and structure. You always respond "
-                        "with valid JSON containing the translations with the same keys."
-                    )
+                    "content": self._system_dict
                 },
                 {
                     "role": "user",

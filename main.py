@@ -37,7 +37,7 @@ async def main():
     )
     parser.add_argument(
         "-m", "--service", default="google",
-        help="Translation service(s) - single service or comma-separated mix (e.g., 'google,cerebras,lmstudio')"
+        help="Translation service(s) - single service or comma-separated mix (e.g., 'google,cerebras,lmstudio,nvidia')"
     )
     parser.add_argument(
         "-c", "--concurrency", type=str, default="100",
@@ -50,6 +50,14 @@ async def main():
     parser.add_argument(
         "-k", "--api_key",
         help="API key for services that require it (e.g., bing)"
+    )
+    parser.add_argument(
+        "--api_key_cerebras",
+        help="API key for Cerebras service"
+    )
+    parser.add_argument(
+        "--api_key_nvidia",
+        help="API key for NVIDIA service"
     )
     parser.add_argument(
         "--cache_file",
@@ -126,6 +134,8 @@ async def main():
         target_lang=args.target_lang,
         service_concurrency=service_concurrency,
         api_key=args.api_key,
+        api_key_cerebras=args.api_key_cerebras,
+        api_key_nvidia=args.api_key_nvidia,
         service_batch_size=service_batch_size,
         ignore_patterns=args.ignore_regex
     )
