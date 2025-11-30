@@ -6,7 +6,7 @@ IMPORTANT RULES:
 - Keep special characters, punctuation, and formatting
 - Do not add explanations or comments
 - Maintain the exact structure and keys
-- You must translate
+- If can't translate keep unchanged
 
 Input JSON:
 {items_json}

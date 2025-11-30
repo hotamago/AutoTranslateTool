@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Estimated tokens per character (conservative estimate for mixed content)
 CHARS_PER_TOKEN = 3.5
 # Max tokens to use per request (leaving room for response)
-MAX_INPUT_TOKENS_PER_REQUEST = 8_000
+MAX_INPUT_TOKENS_PER_REQUEST = 1000000
 # Max items to batch in a single request
 MAX_ITEMS_PER_BATCH = 200
 
@@ -289,9 +289,9 @@ class NvidiaOpenAITranslatorService(BaseTranslator):
                     "content": prompt
                 }
             ],
-            temperature=0.6,
+            temperature=0.3,
             top_p=0.9,
-            max_tokens=4096,
+            max_tokens=8192,
             stream=False
         )
     
@@ -365,9 +365,9 @@ class NvidiaOpenAITranslatorService(BaseTranslator):
                     "content": prompt
                 }
             ],
-            temperature=0.6,
+            temperature=0.3,
             top_p=0.9,
-            max_tokens=4096,
+            max_tokens=8192,
             stream=False
         )
     

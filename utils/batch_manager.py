@@ -106,100 +106,136 @@ class BatchManager:
         results: Dict[str, Any] = {}
         results_lock = asyncio.Lock()
         
-        async def process_batch_worker():
-            """Worker that processes batches from the queue."""
-            while True:
-                # Get items for a batch
-                batch_items: List[BatchItem] = []
+        async def process_sub_batch(sub_batch: List[BatchItem]):
+            """Process a single sub-batch independently."""
+            if not sub_batch:
+                return
+            
+            try:
+                batch_results = await processor(sub_batch)
                 
-                # Try to get at least one item (blocking)
-                try:
-                    item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                    batch_items.append(item)
-                except asyncio.TimeoutError:
-                    # Queue is likely empty, check if we should exit
-                    if self.queue.empty():
-                        break
-                    continue
+                # Handle success
+                if self.on_success:
+                    await self._call_callback(self.on_success, sub_batch, batch_results)
                 
-                # Try to get more items up to batch_size (non-blocking)
-                while len(batch_items) < self.batch_size:
-                    try:
-                        item = self.queue.get_nowait()
-                        batch_items.append(item)
-                    except asyncio.QueueEmpty:
-                        break
-                
-                if not batch_items:
-                    break
-                
-                # Build batch (may return single batch or list of sub-batches)
-                built_batch = self._build_batch(batch_items)
-                
-                # Normalize to list of batches (batch_builder may return multiple sub-batches)
-                if not built_batch:
-                    # Empty batch, skip
-                    continue
-                elif isinstance(built_batch, list) and len(built_batch) > 0 and isinstance(built_batch[0], list):
-                    # batch_builder returned list of sub-batches
-                    sub_batches = built_batch
-                else:
-                    # Single batch
-                    sub_batches = [built_batch]
-                
-                # Process each sub-batch
-                for sub_batch in sub_batches:
-                    if not sub_batch:
-                        continue
-                    
-                    try:
-                        batch_results = await processor(sub_batch)
-                        
-                        # Handle success
-                        if self.on_success:
-                            await self._call_callback(self.on_success, sub_batch, batch_results)
-                        
-                        # Store results
-                        async with results_lock:
-                            if isinstance(batch_results, dict):
-                                # Dictionary results (key -> value mapping)
-                                for item in sub_batch:
-                                    if item.key in batch_results:
-                                        results[item.key] = batch_results[item.key]
-                                        self.stats['processed_items'] += 1
-                                    else:
-                                        # Missing key, put back in queue
-                                        await self._requeue_item(item)
-                            elif isinstance(batch_results, list):
-                                # List results (same order as sub_batch)
-                                for item, result in zip(sub_batch, batch_results):
-                                    if result is not None:
-                                        results[item.key] = result
-                                        self.stats['processed_items'] += 1
-                                    else:
-                                        # None result, put back in queue
-                                        await self._requeue_item(item)
+                # Store results
+                async with results_lock:
+                    if isinstance(batch_results, dict):
+                        # Dictionary results (key -> value mapping)
+                        for item in sub_batch:
+                            if item.key in batch_results:
+                                results[item.key] = batch_results[item.key]
+                                self.stats['processed_items'] += 1
                             else:
-                                # Single result or other format
-                                logger.warning(f"Unexpected batch result type: {type(batch_results)}")
-                                # Put all items back
-                                for item in sub_batch:
-                                    await self._requeue_item(item)
-                        
-                        # Update progress
-                        if progress_callback:
-                            progress_callback(len(sub_batch))
-                    
-                    except Exception as e:
-                        # Handle failure
-                        if self.on_failure:
-                            await self._call_callback(self.on_failure, sub_batch, e)
-                        
-                        # Put failed items back in queue for retry
+                                # Missing key, put back in queue
+                                await self._requeue_item(item)
+                    elif isinstance(batch_results, list):
+                        # List results (same order as sub_batch)
+                        for item, result in zip(sub_batch, batch_results):
+                            if result is not None:
+                                results[item.key] = result
+                                self.stats['processed_items'] += 1
+                            else:
+                                # None result, put back in queue
+                                await self._requeue_item(item)
+                    else:
+                        # Single result or other format
+                        logger.warning(f"Unexpected batch result type: {type(batch_results)}")
+                        # Put all items back
                         for item in sub_batch:
                             await self._requeue_item(item)
-                        
-                        logger.warning(f"Sub-batch processing failed: {e}, requeuing {len(sub_batch)} items")
+                
+                # Update progress
+                if progress_callback:
+                    progress_callback(len(sub_batch))
+            
+            except Exception as e:
+                # Handle failure
+                if self.on_failure:
+                    await self._call_callback(self.on_failure, sub_batch, e)
+                
+                # Put failed items back in queue for retry
+                for item in sub_batch:
+                    await self._requeue_item(item)
+                
+                logger.warning(f"Sub-batch processing failed: {e}, requeuing {len(sub_batch)} items")
+        
+        async def process_batch_worker():
+            """Worker that processes batches from the queue without blocking on slow batches."""
+            active_tasks = set()
+            
+            try:
+                while True:
+                    # Clean up completed tasks
+                    active_tasks = {t for t in active_tasks if not t.done()}
+                    
+                    # Get items for a batch (non-blocking if possible)
+                    batch_items: List[BatchItem] = []
+                    
+                    # Try to get at least one item (with short timeout to avoid blocking)
+                    try:
+                        item = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                        batch_items.append(item)
+                    except asyncio.TimeoutError:
+                        # No items available right now
+                        # Check if we should exit: queue empty AND no active tasks
+                        if self.queue.empty() and not active_tasks:
+                            # Double-check with a slightly longer wait
+                            try:
+                                item = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+                                # Item arrived, put it back and continue
+                                await self.queue.put(item)
+                            except asyncio.TimeoutError:
+                                # Queue still empty and no active tasks - exit
+                                break
+                        # If we have active tasks, wait a bit for them to complete
+                        if active_tasks:
+                            await asyncio.sleep(0.01)
+                        continue
+                    
+                    # Try to get more items up to batch_size (non-blocking)
+                    while len(batch_items) < self.batch_size:
+                        try:
+                            item = self.queue.get_nowait()
+                            batch_items.append(item)
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    if not batch_items:
+                        continue
+                    
+                    # Build batch (may return single batch or list of sub-batches)
+                    built_batch = self._build_batch(batch_items)
+                    
+                    # Normalize to list of batches (batch_builder may return multiple sub-batches)
+                    if not built_batch:
+                        # Empty batch, skip
+                        continue
+                    elif isinstance(built_batch, list) and len(built_batch) > 0 and isinstance(built_batch[0], list):
+                        # batch_builder returned list of sub-batches
+                        sub_batches = built_batch
+                    else:
+                        # Single batch
+                        sub_batches = [built_batch]
+                    
+                    # Process each sub-batch concurrently as independent tasks
+                    # Don't wait for them - immediately continue to get next batch
+                    for sub_batch in sub_batches:
+                        if sub_batch:
+                            task = asyncio.create_task(process_sub_batch(sub_batch))
+                            active_tasks.add(task)
+                            
+                            # Limit number of active tasks to prevent memory issues
+                            # Allow up to concurrency * 2 active tasks per worker
+                            max_active_tasks = max(concurrency * 2, 10)
+                            if len(active_tasks) >= max_active_tasks:
+                                # Wait for at least one task to complete
+                                done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                                active_tasks = pending
+            finally:
+                # Wait for all active tasks to complete before worker exits
+                if active_tasks:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
         
         # Start worker tasks
         workers = [

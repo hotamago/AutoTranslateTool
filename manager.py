@@ -125,7 +125,8 @@ class TranslationManager:
                 # Use service-specific API key if provided, otherwise fall back to general api_key
                 nvidia_api_key = self.api_key_nvidia or self.api_key
                 self.translators[service] = NvidiaOpenAITranslatorService(
-                    self.source_lang, self.target_lang, concurrency, nvidia_api_key, items_per_batch=batch_size
+                    self.source_lang, self.target_lang, concurrency, nvidia_api_key, items_per_batch=batch_size,
+                    model="meta/llama-4-maverick-17b-128e-instruct"
                 )
             else:
                 logger.warning(f"Service '{service}' not explicitly supported. Defaulting to Google.")
