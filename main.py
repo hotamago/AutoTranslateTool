@@ -37,7 +37,7 @@ async def main():
     )
     parser.add_argument(
         "-m", "--service", default="google",
-        help="Translation service (google, bing, lmstudio)"
+        help="Translation service (google, bing, lmstudio, cerebras)"
     )
     parser.add_argument(
         "-c", "--concurrency", type=int, default=100,

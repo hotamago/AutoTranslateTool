@@ -11,6 +11,7 @@ from translators import (
     GoogleTranslatorService,
     BingTranslatorService,
     LMStudioTranslatorService,
+    CerebrasTranslatorService,
 )
 from utils.cache import load_cache, append_to_cache, append_batch_to_cache, BatchCacheWriter
 from utils.file_handler import load_json_file, save_json_file, finalize_output
@@ -62,6 +63,10 @@ class TranslationManager:
         elif self.service == 'lmstudio':
             return LMStudioTranslatorService(
                 self.source_lang, self.target_lang, self.concurrency, self.api_key
+            )
+        elif self.service == 'cerebras':
+            return CerebrasTranslatorService(
+                self.source_lang, self.target_lang, self.concurrency, self.api_key, items_per_batch=self.batch_size
             )
         else:
             logger.warning(f"Service '{self.service}' not explicitly supported. Defaulting to Google.")
@@ -128,6 +133,8 @@ class TranslationManager:
                 await self._process_lmstudio(pending_items, cache_file)
             elif self.service == 'google':
                 await self._process_google_optimized(pending_items, cache_file)
+            elif self.service == 'cerebras':
+                await self._process_cerebras(pending_items, cache_file)
             else:
                 await self._process_individual(pending_items, cache_file)
         finally:
@@ -257,6 +264,84 @@ class TranslationManager:
     async def _process_google_batch(self, pending_items: Dict, cache_file: str):
         """Legacy batch processing (kept for compatibility)."""
         await self._process_google_optimized(pending_items, cache_file)
+    
+    async def _process_cerebras(self, pending_items: Dict, cache_file: str):
+        """
+        Process items using Cerebras LLM with batch optimization.
+        Uses batch translation within single API calls + concurrent requests.
+        """
+        keys = list(pending_items.keys())
+        values = [pending_items[k] for k in keys]
+        
+        # Separate items to translate from ignored items
+        to_translate_indices: List[int] = []
+        to_translate_values: List[str] = []
+        ignored_items: List[Tuple[str, str]] = []
+        
+        for idx, (key, val) in enumerate(zip(keys, values)):
+            if isinstance(val, str):
+                if self._should_ignore(val):
+                    ignored_items.append((key, val))
+                else:
+                    to_translate_indices.append(idx)
+                    to_translate_values.append(val)
+            else:
+                ignored_items.append((key, val))
+        
+        logger.info(
+            f"Cerebras: Processing {len(to_translate_values)} items to translate, "
+            f"{len(ignored_items)} ignored/non-string items"
+        )
+        
+        # Write ignored items in batch
+        if ignored_items:
+            await append_batch_to_cache(cache_file, ignored_items)
+        
+        if not to_translate_values:
+            return
+        
+        # Initialize cache writer with appropriate buffer size
+        cache_writer = BatchCacheWriter(
+            cache_file,
+            buffer_size=min(200, len(to_translate_values) // 4 + 1),
+            flush_interval=3.0
+        )
+        await cache_writer.start()
+        
+        try:
+            # Process in larger chunks to leverage batch API efficiency
+            chunk_size = self.batch_size
+            
+            with tqdm(
+                total=len(to_translate_values),
+                desc="Translating (Cerebras)",
+                unit="item"
+            ) as pbar:
+                for chunk_start in range(0, len(to_translate_values), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(to_translate_values))
+                    chunk_values = to_translate_values[chunk_start:chunk_end]
+                    chunk_indices = to_translate_indices[chunk_start:chunk_end]
+                    
+                    # Translate chunk using batch method (internally handles batching)
+                    translated_values = await self.translator.translate_batch(chunk_values)
+                    
+                    # Prepare cache items
+                    cache_items = []
+                    for idx, translated in zip(chunk_indices, translated_values):
+                        key = keys[idx]
+                        cache_items.append((key, translated))
+                    
+                    # Add to buffered cache writer
+                    await cache_writer.add_batch(cache_items)
+                    
+                    pbar.update(len(chunk_values))
+        finally:
+            await cache_writer.stop()
+        
+        # Print stats
+        if hasattr(self.translator, 'get_stats'):
+            stats = self.translator.get_stats()
+            logger.info(f"Cerebras translation stats: {stats}")
     
     async def _process_individual(self, pending_items: Dict, cache_file: str):
         """Process items individually (for services like Bing)."""
