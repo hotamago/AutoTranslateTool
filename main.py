@@ -40,12 +40,12 @@ async def main():
         help="Translation service (google, bing, nllb, opus-mt, lmstudio)"
     )
     parser.add_argument(
-        "-c", "--concurrency", type=int, default=10,
-        help="Concurrency level (default: 10)"
+        "-c", "--concurrency", type=int, default=100,
+        help="Concurrency level (default: 100, optimized for Google)"
     )
     parser.add_argument(
-        "-b", "--batch_size", type=int, default=10,
-        help="Batch size for NLLB/opus-mt/LM Studio (default: 10)"
+        "-b", "--batch_size", type=int, default=200,
+        help="Batch size for processing (default: 200)"
     )
     parser.add_argument(
         "-k", "--api_key",

@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from deep_translator import MicrosoftTranslator
 
