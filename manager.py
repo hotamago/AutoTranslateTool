@@ -236,16 +236,16 @@ class TranslationManager:
         """
         characteristics = {
             'google': {
-                'preferred_batch_size': 200,  # Large batches work well
+                'preferred_batch_size': 2,  # Large batches work well
                 'concurrency_factor': 1.0,    # High concurrency
-                'speed_factor': 1.0,          # Fast
+                'speed_factor': 0.6,          # Fast
                 'supports_batch': True,
                 'preferred_item_size': 'small'  # Good for many small items
             },
             'cerebras': {
-                'preferred_batch_size': 30,   # Smaller batches due to token limits
+                'preferred_batch_size': 80,   # Smaller batches due to token limits
                 'concurrency_factor': 0.2,     # Lower concurrency due to rate limits
-                'speed_factor': 0.3,          # Slower but high quality
+                'speed_factor': 1.0,          # Very fast
                 'supports_batch': True,
                 'preferred_item_size': 'medium'  # Good for medium batches
             },
@@ -264,16 +264,16 @@ class TranslationManager:
                 'preferred_item_size': 'small'  # Good for many small items
             },
             'nvidia': {
-                'preferred_batch_size': 50,   # Medium batches
+                'preferred_batch_size': 20,   # Medium batches
                 'concurrency_factor': 0.6,     # Moderate concurrency
-                'speed_factor': 0.7,          # Good speed
+                'speed_factor': 0.2,          # Very slow
                 'supports_batch': True,
                 'preferred_item_size': 'medium'  # Good for medium batches
             },
             'nvidia-openai': {
-                'preferred_batch_size': 50,   # Medium batches
+                'preferred_batch_size': 20,   # Medium batches
                 'concurrency_factor': 0.6,     # Moderate concurrency
-                'speed_factor': 0.7,          # Good speed
+                'speed_factor': 0.2,          # Very slow
                 'supports_batch': True,
                 'preferred_item_size': 'medium'  # Good for medium batches
             }
